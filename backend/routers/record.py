@@ -18,6 +18,15 @@ def create_record(record: RecordCreate, db: Session = Depends(get_db)):
     return db_record
 
 
+@router.post("/bulk")
+def create_records_bulk(records: List[RecordCreate], db: Session = Depends(get_db)):
+    db_records = [RecordModel(**r.model_dump()) for r in records]
+    db.bulk_save_objects(db_records)
+    db.commit()
+    return {"message": f"Successfully inserted {len(db_records)} records"}
+
+
+
 @router.get("/", response_model=List[Record])
 def get_records(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
     records = db.query(RecordModel).offset(skip).limit(limit).all()
