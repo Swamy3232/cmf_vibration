@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { useTheme } from '../../contexts/ThemeContext';
-import { API_BASE_URL } from '../../config/api';
+import { useTheme } from '../contexts/ThemeContext';
+import { API_BASE_URL } from '../config/api';
 
 const MachineConfig = () => {
   const { isDarkMode } = useTheme();
