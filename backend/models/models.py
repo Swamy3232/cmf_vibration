@@ -54,16 +54,22 @@ class Checkpoint(Base):
 
     # Relationships
     master_table = relationship("MasterTable", back_populates="checkpoints")
-    records = relationship("Record", back_populates="checkpoint")
+    records = relationship("Record", back_populates="checkpoint", cascade="all, delete-orphan")
 
 
 class Record(Base):
     __tablename__ = 'record'
 
-    id = Column(Integer, primary_key=True, index=True)
-    checkpoint_id = Column(Integer, ForeignKey('checkpoint.id'), nullable=False)
-    timestamp = Column(DateTime, nullable=True)
-    value = Column(Float, nullable=True)
+    # Composite primary key (checkpoint_id, timestamp) for TimescaleDB compatibility
+    checkpoint_id = Column(Integer, ForeignKey('checkpoint.id', ondelete='CASCADE'), primary_key=True)
+    timestamp = Column(DateTime, primary_key=True)
+    
+    # 4-byte REAL columns for each axis
+    x = Column(Float(precision=24), nullable=True)
+    y = Column(Float(precision=24), nullable=True)
+    z = Column(Float(precision=24), nullable=True)
 
     # Relationships
     checkpoint = relationship("Checkpoint", back_populates="records")
+
+

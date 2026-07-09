@@ -5,8 +5,10 @@ from pydantic import BaseModel
 
 class RecordBase(BaseModel):
     checkpoint_id: int
-    timestamp: Optional[datetime] = None
-    value: Optional[float] = None
+    timestamp: datetime
+    x: Optional[float] = None
+    y: Optional[float] = None
+    z: Optional[float] = None
 
 
 class RecordCreate(RecordBase):
@@ -18,7 +20,5 @@ class RecordUpdate(RecordBase):
 
 
 class Record(RecordBase):
-    id: int
-
     class Config:
         from_attributes = True
