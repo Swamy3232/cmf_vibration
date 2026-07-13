@@ -24,6 +24,45 @@ def get_checkpoints(skip: int = 0, limit: int = 100, db: Session = Depends(get_d
     return checkpoints
 
 
+@router.get("/base/recent", response_model=Checkpoint)
+def get_recent_base_checkpoint(master_id: int | None = None, db: Session = Depends(get_db)):
+    """
+    Returns the most recent checkpoint where is_base=True.
+    Optionally filter by master_id to scope to a specific machine configuration.
+    """
+    query = db.query(CheckpointModel).filter(CheckpointModel.is_base == True)
+
+    if master_id is not None:
+        query = query.filter(CheckpointModel.master_id == master_id)
+
+    checkpoint = query.order_by(CheckpointModel.start.desc()).first()
+
+    if not checkpoint:
+        detail = (
+            f"No base checkpoint found for master_id={master_id}"
+            if master_id is not None
+            else "No base checkpoint found"
+        )
+        raise HTTPException(status_code=404, detail=detail)
+
+    return checkpoint
+
+
+@router.get("/brief")
+def get_checkpoints_brief(master_id: int | None = None, db: Session = Depends(get_db)):
+    """
+    Returns a list of checkpoints containing only their id and start timestamp.
+    Optionally filter by master_id.
+    """
+    query = db.query(CheckpointModel.id, CheckpointModel.start)
+    if master_id is not None:
+        query = query.filter(CheckpointModel.master_id == master_id)
+    
+    results = query.order_by(CheckpointModel.start.desc()).all()
+    return [{"id": r.id, "start": r.start} for r in results]
+
+
+
 @router.get("/{checkpoint_id}", response_model=Checkpoint)
 def get_checkpoint(checkpoint_id: int, db: Session = Depends(get_db)):
     checkpoint = db.query(CheckpointModel).filter(CheckpointModel.id == checkpoint_id).first()

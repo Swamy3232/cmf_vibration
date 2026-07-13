@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import machine, master_table, checkpoint, record, defects, fft, vibration
+from routers import machine, master_table, checkpoint, record, defects, fft, vibration, timedomain
 from db import engine, Base
 from models.models import Machine, MasterTable, Checkpoint, Record
 
@@ -102,6 +102,7 @@ app.include_router(record.router)
 app.include_router(defects.router)
 app.include_router(fft.router)
 app.include_router(vibration.router)
+app.include_router(timedomain.router)
 
 
 @app.get("/")

@@ -16,6 +16,7 @@ def get_machine_defects(machine_id: int, db: Session = Depends(get_db)):
     
     Args:
         machine_id: ID of the machine
+        measurement_point: Measurement point name
         db: Database session
     
     Returns:
@@ -71,3 +72,38 @@ def get_machine_defects(machine_id: int, db: Session = Depends(get_db)):
         "total_records": len(results),
         "defects": results
     }
+
+
+@router.get("/getdefect")
+def get_defect_frequencies_calculator(
+    no_of_balls: int = 9,
+    ball_circle_diameter: float = 7.94,
+    pitch_circle_diameter: float = 39.04,
+    angle: float = 0.0,
+):
+    """
+    Direct calculator endpoint to compute bearing defect frequencies from custom geometry inputs.
+    """
+    if pitch_circle_diameter <= 0 or ball_circle_diameter <= 0 or no_of_balls <= 0:
+        raise HTTPException(status_code=400, detail="Diameters and number of balls must be positive values.")
+    if ball_circle_diameter >= pitch_circle_diameter:
+        raise HTTPException(status_code=400, detail="Ball circle diameter (bd) must be less than pitch circle diameter (pd).")
+
+    try:
+        defects = calculate_defects(
+            no_of_balls=no_of_balls,
+            ball_circle_diameter=ball_circle_diameter,
+            pitch_circle_diameter=pitch_circle_diameter,
+            angle=angle
+        )
+        return {
+            "inputs": {
+                "no_of_balls": no_of_balls,
+                "ball_circle_diameter": ball_circle_diameter,
+                "pitch_circle_diameter": pitch_circle_diameter,
+                "angle": angle
+            },
+            "defects": defects
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

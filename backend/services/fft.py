@@ -82,8 +82,9 @@ def get_fft_plot(
     max_points: int = 2000,
     freq_min: float = 0.0,
     freq_max: Optional[float] = None,
+    unit: str = "accel",
 ) -> dict:
-    """Compute downsampled FFT spectrum for plotting a single axis."""
+    """Compute downsampled FFT spectrum for plotting a single axis with optional integration to velocity or displacement."""
     signal = fetch_axis_samples(checkpoint_id, axis)
     if signal.size < 2:
         raise ValueError(f"No data available for axis '{axis}'")
@@ -98,8 +99,28 @@ def get_fft_plot(
     if freq_max > nyquist:
         freq_max = nyquist
 
-    rms = compute_rms(signal)
     freqs, magnitudes = compute_fft(signal)
+
+    # Perform frequency domain integration if requested
+    if unit == "vel":
+        # Convert g to m/s^2 (x9.80665), integrate (/ 2*pi*f), convert to mm/s (x1000)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            vel_mags = (magnitudes * 9.80665 * 1000.0) / (2 * np.pi * freqs)
+            vel_mags[freqs == 0] = 0.0
+            magnitudes = vel_mags
+        # RMS from integrated spectrum
+        rms = float(np.sqrt(np.sum((magnitudes[1:] / np.sqrt(2)) ** 2)))
+    elif unit == "disp":
+        # Convert g to m/s^2 (x9.80665), integrate twice (/ (2*pi*f)^2), convert to microns (x1e6)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            disp_mags = (magnitudes * 9.80665 * 1e6) / ((2 * np.pi * freqs) ** 2)
+            disp_mags[freqs == 0] = 0.0
+            magnitudes = disp_mags
+        # RMS from integrated spectrum
+        rms = float(np.sqrt(np.sum((magnitudes[1:] / np.sqrt(2)) ** 2)))
+    else:
+        rms = compute_rms(signal)
+
     dominant_idx = int(np.argmax(magnitudes[1:]) + 1) if len(magnitudes) > 1 else 0
     dominant_frequency_hz = round(float(freqs[dominant_idx]), 2)
     dominant_amplitude = round(float(magnitudes[dominant_idx]), 6)
