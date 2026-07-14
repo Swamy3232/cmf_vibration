@@ -1,5 +1,6 @@
+from datetime import datetime, timedelta
 from typing import List
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from db import get_db
@@ -94,3 +95,81 @@ def delete_checkpoint(checkpoint_id: int, db: Session = Depends(get_db)):
     db.delete(db_checkpoint)
     db.commit()
     return {"message": "Checkpoint deleted successfully"}
+
+
+rms_router = APIRouter(prefix="/api/rms", tags=["rms"])
+
+
+@rms_router.get("/trend")
+def get_rms_trend(
+    master_id: int = Query(...),
+    point: str = Query(...),
+    days: int = Query(7),
+    db: Session = Depends(get_db)
+):
+    if point not in ["x_rms", "y_rms", "z_rms"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid point value. Must be one of: x_rms, y_rms, z_rms"
+        )
+    
+    time_threshold = datetime.now() - timedelta(days=days)
+    column = getattr(CheckpointModel, point)
+    
+    results = (
+        db.query(CheckpointModel.start, column)
+        .filter(CheckpointModel.master_id == master_id)
+        .filter(CheckpointModel.start >= time_threshold)
+        .order_by(CheckpointModel.start.asc())
+        .all()
+    )
+    
+    return [{"start": r[0], "value": r[1]} for r in results]
+
+
+@rms_router.get("/base")
+def get_rms_base(
+    master_id: int = Query(...),
+    point: str = Query(...),
+    db: Session = Depends(get_db)
+):
+    point_map = {
+        "x_axis": "x_rms",
+        "y_axis": "y_rms",
+        "z_axis": "z_rms",
+        "x_rms": "x_rms",
+        "y_rms": "y_rms",
+        "z_rms": "z_rms",
+    }
+    
+    mapped_point = point_map.get(point)
+    if not mapped_point:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid point value. Must be one of: x_axis, y_axis, z_axis, x_rms, y_rms, z_rms"
+        )
+    
+    column = getattr(CheckpointModel, mapped_point)
+    
+    result = (
+        db.query(CheckpointModel.start, column)
+        .filter(CheckpointModel.master_id == master_id)
+        .filter(CheckpointModel.is_base == True)
+        .order_by(CheckpointModel.start.desc())
+        .first()
+    )
+    
+    if not result:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No base checkpoint found for master_id={master_id}"
+        )
+    
+    return {
+        "start": result[0],
+        "base": True,
+        "value": result[1],
+        "rms_value": result[1]
+    }
+
+

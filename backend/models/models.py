@@ -51,6 +51,10 @@ class Checkpoint(Base):
     end = Column(DateTime, nullable=True)
     duration = Column(Float, nullable=True)
     is_base = Column(Boolean, default=False)
+    x_rms = Column(Float, nullable=True)
+    y_rms = Column(Float, nullable=True)
+    z_rms = Column(Float, nullable=True)
+    
 
     # Relationships
     master_table = relationship("MasterTable", back_populates="checkpoints")

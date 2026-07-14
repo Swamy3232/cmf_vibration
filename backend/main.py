@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from routers import machine, master_table, checkpoint, record, defects, fft, vibration, timedomain
+from routers.checkpoint import rms_router
 from db import engine, Base
 from models.models import Machine, MasterTable, Checkpoint, Record
 
@@ -98,6 +99,7 @@ app.add_middleware(
 app.include_router(machine.router)
 app.include_router(master_table.router)
 app.include_router(checkpoint.router)
+app.include_router(rms_router)
 app.include_router(record.router)
 app.include_router(defects.router)
 app.include_router(fft.router)

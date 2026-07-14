@@ -18,6 +18,7 @@ import {
 } from '../theme/vibrationtheme.jsx';
 
 import { API_BASE_URL } from '../config/api';
+import { applyScaling } from '../utils/scalling';
 
 // ─────────────────────────────────────────────
 // COMPONENT
@@ -37,8 +38,8 @@ const Defect = ({ checkpointId }) => {
 
   // ── state ───────────────────────────────────
   const [selectedAxis, setSelectedAxis] = useState('x');
-  const [data, setData] = useState(null);
-  const [chartData, setChartData] = useState([]);
+  const [checkpointPlots, setCheckpointPlots] = useState({});
+  const [scalingType, setScalingType] = useState('linear');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [freqMin, setFreqMin] = useState(DEFAULT_FREQ_MIN);
@@ -47,11 +48,13 @@ const Defect = ({ checkpointId }) => {
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
   // ── dropdown selector states ────────────────
-  const [activeCheckpointId, setActiveCheckpointId] = useState(resolvedId);
+  const [selectedCheckpointIds, setSelectedCheckpointIds] = useState(resolvedId ? [resolvedId] : []);
   const [machines, setMachines] = useState([]);
   const [masterTables, setMasterTables] = useState([]);
   const [briefCheckpoints, setBriefCheckpoints] = useState([]);
   const [selectedMasterId, setSelectedMasterId] = useState(null);
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const dropdownRef = useRef(null);
 
   // ── slider zoom state (client-side, no API call) ───
   const [sliderMin, setSliderMin] = useState(0);
@@ -65,72 +68,147 @@ const Defect = ({ checkpointId }) => {
   const [baseLoading, setBaseLoading] = useState(false);
 
   // ── legend toggle states ─────────────────────
-  const [hideCurrent, setHideCurrent] = useState(false);
+  const [hiddenCheckpointIds, setHiddenCheckpointIds] = useState(new Set());
   const [hideBase, setHideBase] = useState(false);
 
   // ── plot mode toggle state ───────────────────
-  const [mode, setMode] = useState('fft'); // 'fft' or 'time'
+  const [mode, setMode] = useState('fft'); // 'fft', 'time', or 'trend'
   const [selectedUnit, setSelectedUnit] = useState('accel'); // 'accel', 'vel', 'disp'
+  const [trendData, setTrendData] = useState([]);
+  const [baseRms, setBaseRms] = useState(null);
+  const [trendDays, setTrendDays] = useState(7);
+  const [trendLoading, setTrendLoading] = useState(false);
 
   // ── defects toggle states ─────────────────────
   const [defectFrequencies, setDefectFrequencies] = useState(null);
   const [showDefects, setShowDefects] = useState(false);
   const [defectsLoading, setDefectsLoading] = useState(false);
 
+
   const chartRef = useRef(null);
   const uplotInstRef = useRef(null);
-  const abortRef = useRef(null);
   const debounceRef = useRef(null);
 
   // ── fetch ────────────────────────────────────
+  const fetchSinglePlotData = useCallback(async (cpId, axis, fMin, fMax, mPoints, currentMode, selectedUnitVal, signal) => {
+    let url = "";
+    if (currentMode === 'time') {
+      url = `${API_BASE_URL}/timedomain/plot/${cpId}?axis=${axis}&max_points=${mPoints}`;
+    } else {
+      url = `${API_BASE_URL}/vibration/fft-plot/${cpId}?axis=${axis}&max_points=${mPoints}&freq_min=${fMin}&unit=${selectedUnitVal}`;
+      if (fMax !== '' && fMax != null) url += `&freq_max=${fMax}`;
+    }
+
+    const res = await fetch(url, { signal });
+    if (!res.ok) throw new Error(`Server error: ${res.status}`);
+    const json = await res.json();
+
+    let chartPts = [];
+    if (currentMode === 'time') {
+      const tStamps = json.timestamps ?? [];
+      const vals = json.values ?? [];
+      if (tStamps.length > 0) {
+        const startTime = new Date(tStamps[0]).getTime();
+        chartPts = tStamps.map((t, i) => {
+          const relTimeSec = (new Date(t).getTime() - startTime) / 1000;
+          return { freq: relTimeSec, amplitude: vals[i] };
+        });
+      }
+    } else {
+      const freqs = json.frequencies ?? [];
+      const amps = json.magnitudes ?? [];
+      chartPts = freqs.map((freq, i) => ({ freq, amplitude: amps[i] }));
+    }
+    return { data: json, chartData: chartPts };
+  }, []);
+
+  const fetchTrendData = useCallback(async (masterId, axis, days) => {
+    if (!masterId) return;
+    setTrendLoading(true);
+    try {
+      const point = `${axis}_rms`;
+      const [trendRes, baseRes] = await Promise.all([
+        fetch(`${API_BASE_URL}/api/rms/trend?master_id=${masterId}&point=${point}&days=${days}`),
+        fetch(`${API_BASE_URL}/api/rms/base?master_id=${masterId}&point=${point}`)
+      ]);
+      
+      let trendJson = [];
+      if (trendRes.ok) {
+        trendJson = await trendRes.json();
+      }
+      
+      let baseJson = null;
+      if (baseRes.ok) {
+        baseJson = await baseRes.json();
+      }
+      
+      setTrendData(trendJson);
+      setBaseRms(baseJson);
+    } catch (err) {
+      console.error("Error fetching trend/base RMS:", err);
+    } finally {
+      setTrendLoading(false);
+    }
+  }, []);
+
   const fetchPlotData = useCallback(async (axis, fMin, fMax, mPoints, currentMode) => {
-    if (!activeCheckpointId) return;
-    if (abortRef.current) abortRef.current.abort();
-    const ctrl = new AbortController();
-    abortRef.current = ctrl;
+    if (currentMode === 'trend') {
+      if (selectedMasterId) {
+        setLoading(true);
+        await fetchTrendData(selectedMasterId, axis, trendDays);
+        setLoading(false);
+      }
+      return;
+    }
+    if (selectedCheckpointIds.length === 0) {
+      setCheckpointPlots({});
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setError(null);
-    try {
-      let url = "";
-      if (currentMode === 'time') {
-        url = `${API_BASE_URL}/timedomain/plot/${activeCheckpointId}?axis=${axis}&max_points=${mPoints}`;
-      } else {
-        url = `${API_BASE_URL}/vibration/fft-plot/${activeCheckpointId}?axis=${axis}&max_points=${mPoints}&freq_min=${fMin}&unit=${selectedUnit}`;
-        if (fMax !== '' && fMax != null) url += `&freq_max=${fMax}`;
+    const promises = selectedCheckpointIds.map(async (cpId) => {
+      try {
+        const res = await fetchSinglePlotData(cpId, axis, fMin, fMax, mPoints, currentMode, selectedUnit, null);
+        return { cpId, ...res, error: null };
+      } catch (err) {
+        return { cpId, data: null, chartData: [], error: err.message };
       }
+    });
 
-      const res = await fetch(url, { signal: ctrl.signal });
-      if (!res.ok) throw new Error(`Server error: ${res.status}`);
-      const json = await res.json();
-      setData(json);
+    try {
+      const results = await Promise.all(promises);
+      const nextPlots = {};
+      results.forEach(res => {
+        nextPlots[res.cpId] = res;
+      });
+      setCheckpointPlots(nextPlots);
 
-      if (currentMode === 'time') {
-        const tStamps = json.timestamps ?? [];
-        const vals = json.values ?? [];
-        if (tStamps.length > 0) {
-          const startTime = new Date(tStamps[0]).getTime();
-          setChartData(tStamps.map((t, i) => {
-            const relTimeSec = (new Date(t).getTime() - startTime) / 1000;
-            return { freq: relTimeSec, amplitude: vals[i] };
-          }));
-        } else {
-          setChartData([]);
-        }
+      const allFailed = results.every(r => r.error);
+      if (allFailed && results.length > 0) {
+        setError(results[0].error);
       } else {
-        const freqs = json.frequencies ?? [];
-        const amps = json.magnitudes ?? [];
-        setChartData(freqs.map((freq, i) => ({ freq, amplitude: amps[i] })));
+        setError(null);
       }
     } catch (err) {
-      if (err.name === 'AbortError') return;
       setError(err.message);
     } finally {
       setLoading(false);
     }
-  }, [activeCheckpointId, selectedUnit]);
+  }, [selectedCheckpointIds, selectedAxis, mode, selectedUnit, fetchSinglePlotData, selectedMasterId, trendDays, fetchTrendData]);
 
   useEffect(() => {
-    if (!activeCheckpointId) { setError('No checkpoint ID provided.'); setLoading(false); return; }
+    if (mode === 'trend') {
+      if (selectedMasterId) {
+        fetchPlotData(selectedAxis, freqMin, freqMax, maxPoints, mode);
+      }
+      return;
+    }
+    if (selectedCheckpointIds.length === 0) {
+      setError('No checkpoint ID selected.');
+      setLoading(false);
+      return;
+    }
     fetchPlotData(selectedAxis, freqMin, freqMax, maxPoints, mode);
     // If showBase is active, re-fetch base plot with new parameters/axis
     if (showBase) {
@@ -139,8 +217,7 @@ const Defect = ({ checkpointId }) => {
       setBaseChartData([]);
       setBaseData(null);
     }
-    return () => abortRef.current?.abort();
-  }, [selectedAxis, activeCheckpointId, mode, selectedUnit]);
+  }, [selectedAxis, selectedCheckpointIds, mode, selectedUnit, freqMin, freqMax, maxPoints, selectedMasterId, trendDays]);
 
   // Load machines, configs, and active checkpoint metadata on mount
   useEffect(() => {
@@ -156,8 +233,9 @@ const Defect = ({ checkpointId }) => {
         setMachines(machs);
         setMasterTables(masters);
 
-        if (activeCheckpointId) {
-          const cpRes = await fetch(`${API_BASE_URL}/checkpoint/${activeCheckpointId}`);
+        const cpId = selectedCheckpointIds[0];
+        if (cpId) {
+          const cpRes = await fetch(`${API_BASE_URL}/checkpoint/${cpId}`);
           if (cpRes.ok) {
             const cpJson = await cpRes.json();
             setSelectedMasterId(cpJson.master_id);
@@ -188,11 +266,10 @@ const Defect = ({ checkpointId }) => {
         const briefList = await res.json();
         setBriefCheckpoints(briefList);
         if (briefList.length > 0) {
-          setActiveCheckpointId(briefList[0].id);
+          setSelectedCheckpointIds([briefList[0].id]);
         } else {
-          setActiveCheckpointId(null);
-          setData(null);
-          setChartData([]);
+          setSelectedCheckpointIds([]);
+          setCheckpointPlots({});
         }
       }
     } catch (err) {
@@ -202,12 +279,15 @@ const Defect = ({ checkpointId }) => {
 
   // reset slider whenever chart data is replaced
   useEffect(() => {
-    if (chartData.length < 2) return;
-    const lo = chartData[0].freq;
-    const hi = chartData[chartData.length - 1].freq;
+    if (mode === 'trend') return;
+    const primaryCpId = selectedCheckpointIds[0];
+    const primaryChartData = checkpointPlots[primaryCpId]?.chartData;
+    if (!primaryChartData || primaryChartData.length < 2) return;
+    const lo = primaryChartData[0].freq;
+    const hi = primaryChartData[primaryChartData.length - 1].freq;
     setSliderMin(lo);
     setSliderMax(hi);
-  }, [chartData]);
+  }, [selectedCheckpointIds, checkpointPlots, mode]);
 
   const triggerDebounced = () => {
     clearTimeout(debounceRef.current);
@@ -225,10 +305,12 @@ const Defect = ({ checkpointId }) => {
 
   // ── fetch base plot helper ───────────────────
   const fetchBasePlotData = async (axis, fMin, fMax, mPoints, currentMode) => {
+    const cpId = selectedCheckpointIds[0];
+    if (!cpId) return;
     try {
       setBaseLoading(true);
       // Get master_id from checkpoint first
-      const cpRes = await fetch(`${API_BASE_URL}/checkpoint/${activeCheckpointId}`);
+      const cpRes = await fetch(`${API_BASE_URL}/checkpoint/${cpId}`);
       if (!cpRes.ok) throw new Error("Could not find checkpoint metadata.");
       const cpJson = await cpRes.json();
       const masterId = cpJson.master_id;
@@ -336,44 +418,83 @@ const Defect = ({ checkpointId }) => {
 
   const handleModeChange = (newMode) => {
     setMode(newMode);
-    setHideCurrent(false);
+    setHiddenCheckpointIds(new Set());
     setHideBase(false);
   };
 
-  const handleLegendClick = (e) => {
-    if (e.dataKey === 'amplitude') {
-      setHideCurrent(prev => !prev);
-    } else if (e.dataKey === 'baseAmplitude') {
-      setHideBase(prev => !prev);
-    }
-  };
+  const colorsPalette = [
+    ACCENT,
+    '#a855f7',
+    '#10b981',
+    '#f59e0b',
+    '#ec4899',
+    '#3b82f6',
+  ];
 
-  const dominantFreq = data?.dominant_frequency_hz;
+  const primaryCpId = selectedCheckpointIds[0];
+  const primaryPlot = checkpointPlots[primaryCpId];
+  const primaryData = primaryPlot?.data;
+  const primaryChartData = primaryPlot?.chartData ?? [];
+
+  const dominantFreq = primaryData?.dominant_frequency_hz;
 
   // filter and merge current/base FFT datasets using nearest-frequency matching
   const displayData = useMemo(() => {
-    if (!showBase || !baseChartData.length) {
-      return chartData.filter(d => d.freq >= sliderMin && d.freq <= sliderMax);
+    if (mode === 'trend') {
+      if (!trendData || !trendData.length) return [];
+      return trendData.map(d => {
+        return {
+          freq: new Date(d.start).getTime() / 1000,
+          dateStr: new Date(d.start).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }),
+          trendValue: d.value,
+          baseValue: baseRms ? baseRms.value : null
+        };
+      });
     }
 
-    const filteredCurrent = chartData.filter(d => d.freq >= sliderMin && d.freq <= sliderMax);
-    let baseIdx = 0;
+    if (!primaryChartData.length) return [];
 
-    return filteredCurrent.map(d => {
-      // Move base pointer to find the closest frequency bin
-      while (
-        baseIdx < baseChartData.length - 1 &&
-        Math.abs(baseChartData[baseIdx + 1].freq - d.freq) < Math.abs(baseChartData[baseIdx].freq - d.freq)
-      ) {
-        baseIdx++;
+    const filteredPrimary = primaryChartData.filter(d => d.freq >= sliderMin && d.freq <= sliderMax);
+
+    return filteredPrimary.map(d => {
+      const row = { freq: d.freq };
+      row[`amp_${primaryCpId}`] = applyScaling(d.amplitude, scalingType);
+
+      selectedCheckpointIds.slice(1).forEach(cpId => {
+        const otherPlot = checkpointPlots[cpId];
+        if (otherPlot && otherPlot.chartData && otherPlot.chartData.length) {
+          let closestVal = null;
+          let minDiff = Infinity;
+          for (let i = 0; i < otherPlot.chartData.length; i++) {
+            const diff = Math.abs(otherPlot.chartData[i].freq - d.freq);
+            if (diff < minDiff) {
+              minDiff = diff;
+              closestVal = otherPlot.chartData[i].amplitude;
+            }
+          }
+          row[`amp_${cpId}`] = applyScaling(closestVal, scalingType);
+        } else {
+          row[`amp_${cpId}`] = null;
+        }
+      });
+
+      if (showBase && baseChartData.length > 0) {
+        let closestVal = null;
+        let minDiff = Infinity;
+        for (let i = 0; i < baseChartData.length; i++) {
+          const diff = Math.abs(baseChartData[i].freq - d.freq);
+          if (diff < minDiff) {
+            minDiff = diff;
+            closestVal = baseChartData[i].amplitude;
+          }
+        }
+        row.baseAmplitude = applyScaling(closestVal, scalingType);
       }
 
-      return {
-        ...d,
-        baseAmplitude: baseChartData[baseIdx] ? baseChartData[baseIdx].amplitude : null
-      };
+      return row;
     });
-  }, [chartData, baseChartData, showBase, sliderMin, sliderMax]);
+  }, [selectedCheckpointIds, checkpointPlots, baseChartData, showBase, sliderMin, sliderMax, primaryChartData, primaryCpId, scalingType, mode, trendData, baseRms]);
+
 
   // ── uPlot Rendering Effect ───────────────────
   useEffect(() => {
@@ -384,30 +505,63 @@ const Defect = ({ checkpointId }) => {
     }
 
     const xVals = displayData.map(d => d.freq);
-    const yVals = displayData.map(d => d.amplitude);
-    const dataSeries = [xVals, yVals];
+    const dataSeries = [xVals];
 
     const series = [
       {}, // x-series
-      {
-        label: mode === 'time' ? "Waveform" : "Current",
-        show: !hideCurrent,
-        stroke: ACCENT,
-        width: 1.8,
-        fill: isDarkMode ? "rgba(6, 182, 212, 0.08)" : "rgba(6, 182, 212, 0.05)",
-      }
     ];
 
-    if (showBase && baseChartData.length > 0) {
-      const yBaseVals = displayData.map(d => d.baseAmplitude);
-      dataSeries.push(yBaseVals);
+    if (mode === 'trend') {
+      dataSeries.push(displayData.map(d => d.trendValue));
       series.push({
-        label: "Base",
-        show: !hideBase,
-        stroke: DANGER,
-        width: 1.8,
-        fill: "transparent",
+        label: "RMS Trend",
+        show: true,
+        stroke: ACCENT,
+        width: 2.2,
+        fill: isDarkMode ? "rgba(6, 182, 212, 0.05)" : "transparent",
       });
+
+      if (baseRms) {
+        dataSeries.push(displayData.map(d => d.baseValue));
+        series.push({
+          label: "Base RMS",
+          show: true,
+          stroke: DANGER,
+          width: 1.8,
+          fill: "transparent",
+          dash: [5, 5]
+        });
+      }
+    } else {
+      selectedCheckpointIds.forEach((cpId, idx) => {
+        const cpVal = briefCheckpoints.find(c => c.id === cpId);
+        const formattedDate = cpVal && cpVal.start
+          ? new Date(cpVal.start).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
+          : `CP-${cpId}`;
+        const seriesLabel = `${formattedDate} (#${cpId})`;
+        const color = colorsPalette[idx % colorsPalette.length];
+
+        dataSeries.push(displayData.map(d => d[`amp_${cpId}`]));
+        series.push({
+          label: seriesLabel,
+          show: !hiddenCheckpointIds.has(cpId),
+          stroke: color,
+          width: 1.8,
+          fill: isDarkMode ? `rgba(${idx === 0 ? '6, 182, 212' : '168, 85, 247'}, 0.04)` : 'transparent',
+        });
+      });
+
+      if (showBase && baseChartData.length > 0) {
+        const yBaseVals = displayData.map(d => d.baseAmplitude);
+        dataSeries.push(yBaseVals);
+        series.push({
+          label: "Base",
+          show: !hideBase,
+          stroke: DANGER,
+          width: 1.8,
+          fill: "transparent",
+        });
+      }
     }
 
     // Plugin to draw dominant frequency reference line
@@ -511,31 +665,58 @@ const Defect = ({ checkpointId }) => {
           },
           setCursor: (self) => {
             const { idx } = self.cursor;
-            console.log("uPlot cursor idx:", idx, "left:", self.cursor.left, "top:", self.cursor.top);
             if (idx === null || idx === undefined || idx < 0) {
               tooltip.style.display = "none";
               return;
             }
             const xVal = self.data[0][idx];
-            const yVal = self.data[1][idx];
-            if (xVal === undefined || yVal === undefined) {
+            if (xVal === undefined) {
               tooltip.style.display = "none";
               return;
             }
 
-            const unitSuff = mode === 'time' ? 'g' : (selectedUnit === 'vel' ? 'mm/s' : (selectedUnit === 'disp' ? 'µm' : 'g'));
-            let html = `<div><strong>X:</strong> ${mode === 'time' ? `${xVal.toFixed(3)}s` : `${xVal.toFixed(1)} Hz`}</div>`;
-            if (!hideCurrent) {
-              html += `<div style="color: ${ACCENT};"><strong>Current:</strong> ${yVal.toExponential(4)} ${unitSuff}</div>`;
-            }
-            if (showBase && baseChartData.length > 0 && !hideBase && self.data[2]) {
-              const baseVal = self.data[2][idx];
-              if (baseVal !== undefined && baseVal !== null) {
-                html += `<div style="color: ${DANGER};"><strong>Base:</strong> ${baseVal.toExponential(4)} ${unitSuff}</div>`;
+            if (mode === 'trend') {
+              const item = displayData[idx];
+              if (item) {
+                let html = `<div><strong>Time:</strong> ${item.dateStr}</div>`;
+                const trendVal = self.data[1]?.[idx];
+                if (trendVal !== undefined && trendVal !== null) {
+                  html += `<div style="color: ${ACCENT};"><strong>RMS Value:</strong> ${trendVal.toFixed(4)} g</div>`;
+                }
+                if (baseRms) {
+                  const baseVal = self.data[2]?.[idx];
+                  if (baseVal !== undefined && baseVal !== null) {
+                    html += `<div style="color: ${DANGER};"><strong>Base RMS:</strong> ${baseVal.toFixed(4)} g</div>`;
+                  }
+                }
+                tooltip.innerHTML = html;
               }
-            }
+            } else {
+              const unitSuff = mode === 'time' ? 'g' : (selectedUnit === 'vel' ? 'mm/s' : (selectedUnit === 'disp' ? 'µm' : 'g'));
+              let html = `<div><strong>X:</strong> ${mode === 'time' ? `${xVal.toFixed(3)}s` : `${xVal.toFixed(1)} Hz`}</div>`;
+              
+              selectedCheckpointIds.forEach((cpId, sIdx) => {
+                const yVal = self.data[sIdx + 1]?.[idx];
+                if (yVal !== undefined && yVal !== null && !hiddenCheckpointIds.has(cpId)) {
+                  const color = colorsPalette[sIdx % colorsPalette.length];
+                  const cpVal = briefCheckpoints.find(c => c.id === cpId);
+                  const formattedDate = cpVal && cpVal.start
+                    ? new Date(cpVal.start).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
+                    : `CP-${cpId}`;
+                  html += `<div style="color: ${color};"><strong>${formattedDate}:</strong> ${yVal.toExponential(4)} ${unitSuff}</div>`;
+                }
+              });
 
-            tooltip.innerHTML = html;
+              if (showBase && baseChartData.length > 0 && !hideBase) {
+                const baseSeriesIdx = selectedCheckpointIds.length + 1;
+                const baseVal = self.data[baseSeriesIdx]?.[idx];
+                if (baseVal !== undefined && baseVal !== null) {
+                  html += `<div style="color: ${DANGER};"><strong>Base:</strong> ${baseVal.toExponential(4)} ${unitSuff}</div>`;
+                }
+              }
+
+              tooltip.innerHTML = html;
+            }
 
             const cx = self.cursor.left;
             const cy = self.cursor.top;
@@ -572,15 +753,26 @@ const Defect = ({ checkpointId }) => {
           space: 50,
           stroke: COLORS.textSecondary,
           grid: { stroke: COLORS.gridStroke, width: 1 },
-          values: mode === 'time'
-            ? (self, ticks) => ticks.map(t => `${t.toFixed(3)}s`)
-            : (self, ticks) => ticks.map(t => t >= 1000 ? `${(t / 1000).toFixed(1)}k` : t.toFixed(0)),
+          values: mode === 'trend'
+            ? (self, ticks) => ticks.map(t => new Date(t * 1000).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' }))
+            : (mode === 'time'
+                ? (self, ticks) => ticks.map(t => `${t.toFixed(3)}s`)
+                : (self, ticks) => ticks.map(t => t >= 1000 ? `${(t / 1000).toFixed(1)}k` : t.toFixed(0))
+              ),
         },
         {
           space: 30,
           stroke: COLORS.textSecondary,
           grid: { stroke: COLORS.gridStroke, width: 1 },
-          values: (self, ticks) => ticks.map(t => t.toExponential(1)),
+          values: (self, ticks) => ticks.map(t => {
+            if (mode === 'trend') {
+              return t.toFixed(4);
+            }
+            if (scalingType === 'log') {
+              return `10^${t.toFixed(0)}`;
+            }
+            return t.toExponential(1);
+          }),
         }
       ],
       legend: { show: false }
@@ -606,45 +798,83 @@ const Defect = ({ checkpointId }) => {
         uplotInstRef.current = null;
       }
     };
-  }, [displayData, showBase, mode, isDarkMode, COLORS, hideCurrent, hideBase, dominantFreq, selectedUnit, showDefects, defectFrequencies]);
+  }, [displayData, showBase, mode, isDarkMode, COLORS, hiddenCheckpointIds, hideBase, dominantFreq, selectedUnit, showDefects, defectFrequencies, selectedCheckpointIds, briefCheckpoints, scalingType, baseRms]);
 
   const handleExport = () => {
-    if (!chartData.length) return;
-    const csv = ['frequency_hz,amplitude', ...chartData.map(d => `${d.freq},${d.amplitude}`)].join('\n');
+    if (!primaryChartData.length) return;
+    const csv = ['frequency_hz,amplitude', ...primaryChartData.map(d => `${d.freq},${d.amplitude}`)].join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `fft_checkpoint${resolvedId}_${selectedAxis}.csv`;
+    a.download = `fft_checkpoint${primaryCpId}_${selectedAxis}.csv`;
     a.click();
   };
 
   // ── derived metrics ──────────────────────────
-  const METRICS = data ? [
+  const METRICS = [
     {
       label: 'RMS',
-      value: data.rms ? Number(data.rms).toFixed(6) : '—',
       unit: mode === 'time' ? 'g' : (selectedUnit === 'vel' ? 'mm/s' : (selectedUnit === 'disp' ? 'µm' : 'g')),
-      baseValue: showBase && baseData?.rms ? Number(baseData.rms).toFixed(6) : null
+      baseValue: showBase && baseData?.rms ? Number(baseData.rms).toFixed(6) : null,
+      checkpointValues: selectedCheckpointIds.map((cpId, idx) => {
+        const cpPlot = checkpointPlots[cpId];
+        const cpData = cpPlot?.data;
+        const cpVal = briefCheckpoints.find(c => c.id === cpId);
+        const dateStr = cpVal && cpVal.start
+          ? new Date(cpVal.start).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
+          : `CP-${cpId}`;
+        return {
+          cpId,
+          color: colorsPalette[idx % colorsPalette.length],
+          label: dateStr,
+          value: cpData?.rms ? Number(cpData.rms).toFixed(6) : '—'
+        };
+      })
     },
     {
       label: 'Dominant Frequency',
-      value: data.dominant_frequency_hz ? Number(data.dominant_frequency_hz).toFixed(1) : '—',
       unit: 'Hz',
-      color: ACCENT,
-      baseValue: showBase && baseData?.dominant_frequency_hz ? Number(baseData.dominant_frequency_hz).toFixed(1) : null
+      baseValue: showBase && baseData?.dominant_frequency_hz ? Number(baseData.dominant_frequency_hz).toFixed(1) : null,
+      checkpointValues: selectedCheckpointIds.map((cpId, idx) => {
+        const cpPlot = checkpointPlots[cpId];
+        const cpData = cpPlot?.data;
+        const cpVal = briefCheckpoints.find(c => c.id === cpId);
+        const dateStr = cpVal && cpVal.start
+          ? new Date(cpVal.start).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
+          : `CP-${cpId}`;
+        return {
+          cpId,
+          color: colorsPalette[idx % colorsPalette.length],
+          label: dateStr,
+          value: cpData?.dominant_frequency_hz ? Number(cpData.dominant_frequency_hz).toFixed(1) : '—'
+        };
+      })
     },
     {
       label: 'Dominant Amplitude',
-      value: formatAmp(data.dominant_amplitude),
       unit: mode === 'time' ? 'g' : (selectedUnit === 'vel' ? 'mm/s' : (selectedUnit === 'disp' ? 'µm' : 'g')),
-      baseValue: showBase && baseData?.dominant_amplitude ? formatAmp(baseData.dominant_amplitude) : null
+      baseValue: showBase && baseData?.dominant_amplitude ? formatAmp(baseData.dominant_amplitude) : null,
+      checkpointValues: selectedCheckpointIds.map((cpId, idx) => {
+        const cpPlot = checkpointPlots[cpId];
+        const cpData = cpPlot?.data;
+        const cpVal = briefCheckpoints.find(c => c.id === cpId);
+        const dateStr = cpVal && cpVal.start
+          ? new Date(cpVal.start).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
+          : `CP-${cpId}`;
+        return {
+          cpId,
+          color: colorsPalette[idx % colorsPalette.length],
+          label: dateStr,
+          value: cpData ? formatAmp(cpData.dominant_amplitude) : '—'
+        };
+      })
     }
-  ] : [];
+  ];
 
 
   // ── slider derived values ────────────────────
-  const dataFreqLo = chartData.length ? chartData[0].freq : 0;
-  const dataFreqHi = chartData.length ? chartData[chartData.length - 1].freq : 1;
+  const dataFreqLo = primaryChartData.length ? primaryChartData[0].freq : 0;
+  const dataFreqHi = primaryChartData.length ? primaryChartData[primaryChartData.length - 1].freq : 1;
   const freqRange = dataFreqHi - dataFreqLo || 1;
   const leftPct = ((sliderMin - dataFreqLo) / freqRange) * 100;
   const rightPct = 100 - ((sliderMax - dataFreqLo) / freqRange) * 100;
@@ -735,12 +965,11 @@ const Defect = ({ checkpointId }) => {
         No Spectrum Data
       </div>
       <div style={{ fontSize: 12, color: COLORS.textSecondary, fontFamily: "'JetBrains Mono', monospace" }}>
-        Checkpoint {activeCheckpointId ?? '—'} · {selectedAxis.toUpperCase()} axis · no records found
+        Checkpoints {selectedCheckpointIds.join(', ') || '—'} · {selectedAxis.toUpperCase()} axis · no records found
       </div>
     </div>
   );
 
-  // Toolbar button — active state toggles cyan fill
   const TBtn = ({ onClick, children, disabled, active = false, danger = false }) => (
     <button
       className={`vib-tbtn${active ? ' vib-tbtn-active' : ''}${danger && active ? ' vib-tbtn-danger-active' : ''}`}
@@ -751,6 +980,16 @@ const Defect = ({ checkpointId }) => {
       {children}
     </button>
   );
+
+  useEffect(() => {
+    const handleOutsideClick = (e) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target)) {
+        setDropdownOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutsideClick);
+    return () => document.removeEventListener('mousedown', handleOutsideClick);
+  }, []);
 
   // ── render ───────────────────────────────────
   return (
@@ -783,7 +1022,7 @@ const Defect = ({ checkpointId }) => {
               fontSize: 11, color: COLORS.textSecondary, margin: 0,
               fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.03em',
             }}>
-              CP-{activeCheckpointId ?? '—'} &nbsp;·&nbsp; {selectedAxis.toUpperCase()} axis &nbsp;·&nbsp; frequency domain
+              CP-{primaryCpId ?? '—'} &nbsp;·&nbsp; {selectedAxis.toUpperCase()} axis &nbsp;·&nbsp; frequency domain
             </p>
           </div>
           <button
@@ -809,7 +1048,7 @@ const Defect = ({ checkpointId }) => {
         <div style={{
           display: 'flex', gap: 0, flexWrap: 'wrap',
           background: COLORS.card, border: `1px solid ${COLORS.border}`,
-          borderRadius: 10, boxShadow: SHADOW, marginBottom: 16, overflow: 'hidden',
+          borderRadius: 10, boxShadow: SHADOW, marginBottom: 16, overflow: 'visible',
         }}>
           {/* Machine Selector */}
           <div style={{
@@ -850,11 +1089,15 @@ const Defect = ({ checkpointId }) => {
           </div>
 
           {/* Checkpoint Selector */}
-          <div style={{
-            display: 'flex', flexDirection: 'column', gap: 6,
-            padding: '14px 20px', flex: '2 1 240px',
-            borderRight: `1px solid ${COLORS.border}`,
-          }}>
+          <div
+            ref={dropdownRef}
+            style={{
+              display: 'flex', flexDirection: 'column', gap: 6,
+              padding: '14px 20px', flex: '2 1 240px',
+              borderRight: `1px solid ${COLORS.border}`,
+              position: 'relative',
+            }}
+          >
             <span style={{
               fontSize: 9, fontWeight: 700, textTransform: 'uppercase',
               letterSpacing: '0.12em', color: COLORS.textSecondary,
@@ -864,33 +1107,97 @@ const Defect = ({ checkpointId }) => {
               <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
                 <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
               </svg>
-              Checkpoint Session
+              Checkpoint Sessions (Select Multiple)
             </span>
-            <select
-              className="vib-select"
-              value={activeCheckpointId || ''}
-              onChange={e => setActiveCheckpointId(Number(e.target.value))}
+            <button
+              onClick={() => {
+                if (selectedMasterId && briefCheckpoints.length > 0) {
+                  setDropdownOpen(!dropdownOpen);
+                }
+              }}
               disabled={!selectedMasterId || briefCheckpoints.length === 0}
               style={{
                 background: 'transparent', color: COLORS.text,
                 border: 'none', borderBottom: `1px solid ${COLORS.border}`,
-                borderRadius: 0, padding: '4px 0', fontSize: 13, fontWeight: 600,
+                borderRadius: 0, padding: '6px 0', fontSize: 13, fontWeight: 600,
                 minWidth: 240, outline: 'none', cursor: 'pointer',
                 opacity: (!selectedMasterId || briefCheckpoints.length === 0) ? 0.45 : 1,
                 fontFamily: "'JetBrains Mono', monospace",
+                textAlign: 'left',
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
               }}
             >
-              {briefCheckpoints.length === 0 ? (
-                <option value="" style={{ background: isDarkMode ? '#0f1625' : '#fff' }}>— No Checkpoints —</option>
-              ) : (
-                briefCheckpoints.map(cp => {
+              <span>
+                {selectedCheckpointIds.length === 0
+                  ? '— Select Checkpoints —'
+                  : `${selectedCheckpointIds.length} Session${selectedCheckpointIds.length > 1 ? 's' : ''} Selected`}
+              </span>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" style={{ transition: 'transform 0.15s', transform: dropdownOpen ? 'rotate(180deg)' : 'none' }}>
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </button>
+
+            {dropdownOpen && (
+              <div style={{
+                position: 'absolute',
+                top: '100%',
+                left: 0,
+                right: 0,
+                background: COLORS.card,
+                border: `1px solid ${COLORS.border}`,
+                borderRadius: '0 0 8px 8px',
+                boxShadow: '0 8px 24px rgba(0,0,0,0.3)',
+                zIndex: 100,
+                maxHeight: 250,
+                overflowY: 'auto',
+                padding: '8px 0',
+              }}>
+                {briefCheckpoints.map(cp => {
                   const label = cp.start
-                    ? `#${cp.id}  ·  ${new Date(cp.start).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}`
+                    ? `#${cp.id} · ${new Date(cp.start).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}`
                     : `Checkpoint #${cp.id}`;
-                  return <option key={cp.id} value={cp.id} style={{ background: isDarkMode ? '#0f1625' : '#fff' }}>{label}</option>;
-                })
-              )}
-            </select>
+                  const isChecked = selectedCheckpointIds.includes(cp.id);
+                  return (
+                    <label
+                      key={cp.id}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 10,
+                        padding: '8px 16px',
+                        cursor: 'pointer',
+                        fontSize: 12,
+                        color: COLORS.text,
+                        background: isChecked ? COLORS.accentDim : 'transparent',
+                        transition: 'background 0.15s',
+                        fontFamily: "'JetBrains Mono', monospace",
+                      }}
+                      onMouseEnter={e => { if (!isChecked) e.currentTarget.style.background = COLORS.cardAlt; }}
+                      onMouseLeave={e => { if (!isChecked) e.currentTarget.style.background = 'transparent'; }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={() => {
+                          setSelectedCheckpointIds(prev => {
+                            if (prev.includes(cp.id)) {
+                              if (prev.length === 1) return prev;
+                              return prev.filter(id => id !== cp.id);
+                            } else {
+                              return [...prev, cp.id];
+                            }
+                          });
+                        }}
+                        style={{ accentColor: ACCENT, cursor: 'pointer' }}
+                      />
+                      <span>{label}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           {/* Toggle Button */}
@@ -924,28 +1231,57 @@ const Defect = ({ checkpointId }) => {
               background: COLORS.cardAlt, alignItems: 'center',
               animation: 'dash-slideDown 0.18s ease-out',
             }}>
-              <div style={{ flex: 1, minWidth: 100 }}>
-                <label style={{ ...styles.label, marginBottom: 2 }}>Freq Min (Hz)</label>
-                <input type="number" value={freqMin} min={0} onChange={handleFreqMinChange}
-                  style={{ ...styles.input, padding: '5px 8px', fontSize: 12 }}
-                  onFocus={e => { e.target.style.borderColor = ACCENT; e.target.style.boxShadow = `0 0 0 3px ${COLORS.accentDim}`; }}
-                  onBlur={e => { e.target.style.borderColor = COLORS.border; e.target.style.boxShadow = 'none'; }} />
-              </div>
-              <div style={{ flex: 1, minWidth: 100 }}>
-                <label style={{ ...styles.label, marginBottom: 2 }}>Freq Max (Hz)</label>
-                <input type="number" value={freqMax} min={0} placeholder="Auto (Nyquist)" onChange={handleFreqMaxChange}
-                  style={{ ...styles.input, padding: '5px 8px', fontSize: 12 }}
-                  onFocus={e => { e.target.style.borderColor = ACCENT; e.target.style.boxShadow = `0 0 0 3px ${COLORS.accentDim}`; }}
-                  onBlur={e => { e.target.style.borderColor = COLORS.border; e.target.style.boxShadow = 'none'; }} />
-              </div>
-              <div style={{ flex: 2, minWidth: 180 }}>
-                <label style={{ ...styles.label, marginBottom: 0 }}>
-                  Points: <span style={{ fontFamily: "'JetBrains Mono', monospace", color: ACCENT }}>{Number(maxPoints).toLocaleString()}</span>
-                </label>
-                <input type="range" min={100} max={20000} step={100} value={maxPoints}
-                  onChange={handleMaxPointsChange}
-                  style={{ width: '100%', accentColor: ACCENT, marginTop: 4, height: 4 }} />
-              </div>
+              {mode === 'trend' ? (
+                <div style={{ flex: 1, minWidth: 150 }}>
+                  <label style={{ ...styles.label, marginBottom: 2 }}>Trend Duration</label>
+                  <select
+                    value={trendDays}
+                    onChange={e => setTrendDays(parseInt(e.target.value, 10))}
+                    className="vib-select"
+                    style={{
+                      background: 'transparent',
+                      color: COLORS.text,
+                      border: `1px solid ${COLORS.border}`,
+                      borderRadius: 4,
+                      padding: '5px 8px',
+                      fontSize: 12,
+                      width: '100%',
+                      outline: 'none',
+                      cursor: 'pointer',
+                      fontFamily: "'Inter', sans-serif"
+                    }}
+                  >
+                    {[1, 2, 3, 5, 7, 14, 30, 90].map(d => (
+                      <option key={d} value={d} style={{ background: isDarkMode ? '#0f1625' : '#fff' }}>{d} Days</option>
+                    ))}
+                  </select>
+                </div>
+              ) : (
+                <>
+                  <div style={{ flex: 1, minWidth: 100 }}>
+                    <label style={{ ...styles.label, marginBottom: 2 }}>Freq Min (Hz)</label>
+                    <input type="number" value={freqMin} min={0} onChange={handleFreqMinChange}
+                      style={{ ...styles.input, padding: '5px 8px', fontSize: 12 }}
+                      onFocus={e => { e.target.style.borderColor = ACCENT; e.target.style.boxShadow = `0 0 0 3px ${COLORS.accentDim}`; }}
+                      onBlur={e => { e.target.style.borderColor = COLORS.border; e.target.style.boxShadow = 'none'; }} />
+                  </div>
+                  <div style={{ flex: 1, minWidth: 100 }}>
+                    <label style={{ ...styles.label, marginBottom: 2 }}>Freq Max (Hz)</label>
+                    <input type="number" value={freqMax} min={0} placeholder="Auto (Nyquist)" onChange={handleFreqMaxChange}
+                      style={{ ...styles.input, padding: '5px 8px', fontSize: 12 }}
+                      onFocus={e => { e.target.style.borderColor = ACCENT; e.target.style.boxShadow = `0 0 0 3px ${COLORS.accentDim}`; }}
+                      onBlur={e => { e.target.style.borderColor = COLORS.border; e.target.style.boxShadow = 'none'; }} />
+                  </div>
+                  <div style={{ flex: 2, minWidth: 180 }}>
+                    <label style={{ ...styles.label, marginBottom: 0 }}>
+                      Points: <span style={{ fontFamily: "'JetBrains Mono', monospace", color: ACCENT }}>{Number(maxPoints).toLocaleString()}</span>
+                    </label>
+                    <input type="range" min={100} max={20000} step={100} value={maxPoints}
+                      onChange={handleMaxPointsChange}
+                      style={{ width: '100%', accentColor: ACCENT, marginTop: 4, height: 4 }} />
+                  </div>
+                </>
+              )}
             </div>
           )}
         </div>
@@ -996,85 +1332,114 @@ const Defect = ({ checkpointId }) => {
               ))}
             </div>
           )}
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <span style={{
+              fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.12em',
+              color: COLORS.textSecondary, marginRight: 4,
+              fontFamily: "'JetBrains Mono', monospace",
+            }}>
+              Scale
+            </span>
+            {[
+              { key: 'linear', label: 'Linear' },
+              { key: 'log', label: 'Log' }
+            ].map(({ key, label }) => (
+              <button key={key} style={styles.axisBtn(scalingType === key)}
+                onClick={() => setScalingType(key)}
+                onMouseEnter={e => { if (scalingType !== key) { e.currentTarget.style.borderColor = ACCENT; e.currentTarget.style.color = ACCENT; } }}
+                onMouseLeave={e => { if (scalingType !== key) { e.currentTarget.style.borderColor = COLORS.border; e.currentTarget.style.color = COLORS.textSecondary; } }}>
+                {label}
+              </button>
+            ))}
+          </div>
         </div>
 
         {/* ── CONTENT ── */}
-        {loading ? <LoadingUI /> : error ? <ErrorUI /> : !data || !chartData.length ? <EmptyState /> : (
+        {loading ? <LoadingUI /> : error ? <ErrorUI /> : selectedCheckpointIds.length === 0 || !primaryChartData.length ? <EmptyState /> : (
           <>
             {/* ── METRIC CARDS ROW ── */}
-            <div
-              style={{ display: 'grid', gridTemplateColumns: `repeat(${showDefects && defectFrequencies && mode === 'fft' ? 4 : 3}, 1fr)`, gap: 12, marginBottom: 16 }}
-              className="fft-stat-grid"
-            >
-              {METRICS.map((m, mi) => (
-                <div key={m.label}
-                  style={{ ...styles.metricCard, borderLeftColor: [ACCENT, WARNING, DANGER][mi] || ACCENT }}
-                  onMouseEnter={onCardEnter} onMouseLeave={onCardLeave}
-                >
-                  <div style={styles.metricLabel}>{m.label}</div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                    <div style={{ display: 'flex', alignItems: 'baseline', gap: 2 }}>
-                      <span style={{ ...styles.metricValue, color: m.color || COLORS.text }}>{m.value}</span>
-                      {m.unit && <span style={styles.metricUnit}>{m.unit}</span>}
-                    </div>
-                    {m.baseValue && (
-                      <div style={{
-                        fontSize: 10, fontWeight: 700, color: DANGER, marginTop: 2,
-                        display: 'flex', alignItems: 'center', gap: 4,
-                        fontFamily: "'JetBrains Mono', monospace",
-                      }}>
-                        <span style={{ padding: '1px 4px', borderRadius: 3, background: COLORS.dangerDim, fontSize: 8, letterSpacing: '0.06em' }}>BASE</span>
-                        <span>{m.baseValue} {m.unit}</span>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ))}
-
-              {/* DEFECT METRICS CARD */}
-              {showDefects && defectFrequencies && mode === 'fft' && (
-                <div
-                  style={{ ...styles.metricCard, borderLeftColor: '#f97316', display: 'flex', flexDirection: 'column', justifyContent: 'center' }}
-                  onMouseEnter={onCardEnter} onMouseLeave={onCardLeave}
-                >
-                  <div style={{ ...styles.metricLabel, marginBottom: 8 }}>Bearing Defect Freqs</div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 12px' }}>
-                    {Object.entries(defectFrequencies).map(([key, freq]) => {
-                      if (!freq) return null;
-                      let amplitude = 0;
-                      if (chartData && chartData.length > 0) {
-                        let closestIdx = 0, minDiff = Infinity;
-                        for (let i = 0; i < chartData.length; i++) {
-                          const diff = Math.abs(chartData[i].freq - freq);
-                          if (diff < minDiff) { minDiff = diff; closestIdx = i; }
-                        }
-                        amplitude = chartData[closestIdx].amplitude;
-                      }
-                      const labels = { outer_race: 'BPFO', inner_race: 'BPFI', ball_defect: 'BSF', cage_defect: 'FTF' };
-                      const colors = { outer_race: '#ef4444', inner_race: '#f97316', ball_defect: '#3b82f6', cage_defect: '#10b981' };
-                      const unitSuff = selectedUnit === 'vel' ? 'mm/s' : (selectedUnit === 'disp' ? 'µm' : 'g');
-                      return (
-                        <div key={key} style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-                          <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                            <span style={{ fontSize: 9, color: COLORS.textSecondary, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.06em' }}>
-                              {labels[key] || key}
-                            </span>
-                            <span style={{ fontSize: 11, color: colors[key], fontFamily: "'JetBrains Mono', monospace", fontWeight: 700 }}>
-                              {Number(freq).toFixed(1)}<span style={{ fontSize: 8, opacity: 0.7 }}> Hz</span>
-                            </span>
-                          </div>
-                          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
-                            <span style={{ fontSize: 9, color: COLORS.textSecondary, fontFamily: "'JetBrains Mono', monospace" }}>
-                              {amplitude.toExponential(1)} <span style={{ fontSize: 7 }}>{unitSuff}</span>
-                            </span>
+            {mode === 'fft' && (
+              <div
+                style={{ display: 'grid', gridTemplateColumns: `repeat(${showDefects && defectFrequencies && mode === 'fft' ? 4 : 3}, 1fr)`, gap: 12, marginBottom: 16 }}
+                className="fft-stat-grid"
+              >
+                {METRICS.map((m, mi) => (
+                  <div key={m.label}
+                    style={{ ...styles.metricCard, borderLeftColor: [ACCENT, WARNING, DANGER][mi] || ACCENT, display: 'flex', flexDirection: 'column', gap: 6 }}
+                    onMouseEnter={onCardEnter} onMouseLeave={onCardLeave}
+                  >
+                    <div style={styles.metricLabel}>{m.label}</div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1, justifyContent: 'center' }}>
+                      {m.checkpointValues.map((cv) => (
+                        <div key={cv.cpId} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: m.checkpointValues.length > 1 ? `1px solid ${COLORS.border}33` : 'none', paddingBottom: m.checkpointValues.length > 1 ? 4 : 0 }}>
+                          <span style={{ fontSize: 10, fontWeight: 700, color: cv.color, fontFamily: "'JetBrains Mono', monospace" }}>
+                            {cv.label}
+                          </span>
+                          <div style={{ display: 'flex', alignItems: 'baseline', gap: 2 }}>
+                            <span style={{ ...styles.metricValue, color: COLORS.text, fontSize: 14 }}>{cv.value}</span>
+                            {m.unit && <span style={{ ...styles.metricUnit, fontSize: 10 }}>{m.unit}</span>}
                           </div>
                         </div>
-                      );
-                    })}
+                      ))}
+                      {m.baseValue && (
+                        <div style={{
+                          fontSize: 10, fontWeight: 700, color: DANGER, marginTop: 4,
+                          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                          fontFamily: "'JetBrains Mono', monospace",
+                        }}>
+                          <span style={{ padding: '1px 4px', borderRadius: 3, background: COLORS.dangerDim, fontSize: 8, letterSpacing: '0.06em' }}>BASE</span>
+                          <span>{m.baseValue} {m.unit}</span>
+                        </div>
+                      )}
+                    </div>
                   </div>
-                </div>
-              )}
-            </div>
+                ))}
+
+                {/* DEFECT METRICS CARD */}
+                {showDefects && defectFrequencies && mode === 'fft' && (
+                  <div
+                    style={{ ...styles.metricCard, borderLeftColor: '#f97316', display: 'flex', flexDirection: 'column', justifyContent: 'center' }}
+                    onMouseEnter={onCardEnter} onMouseLeave={onCardLeave}
+                  >
+                    <div style={{ ...styles.metricLabel, marginBottom: 8 }}>Bearing Defect Freqs</div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 12px' }}>
+                      {Object.entries(defectFrequencies).map(([key, freq]) => {
+                        if (!freq) return null;
+                        let amplitude = 0;
+                        if (primaryChartData && primaryChartData.length > 0) {
+                          let closestIdx = 0, minDiff = Infinity;
+                          for (let i = 0; i < primaryChartData.length; i++) {
+                            const diff = Math.abs(primaryChartData[i].freq - freq);
+                            if (diff < minDiff) { minDiff = diff; closestIdx = i; }
+                          }
+                          amplitude = primaryChartData[closestIdx].amplitude;
+                        }
+                        const labels = { outer_race: 'BPFO', inner_race: 'BPFI', ball_defect: 'BSF', cage_defect: 'FTF' };
+                        const colors = { outer_race: '#ef4444', inner_race: '#f97316', ball_defect: '#3b82f6', cage_defect: '#10b981' };
+                        const unitSuff = selectedUnit === 'vel' ? 'mm/s' : (selectedUnit === 'disp' ? 'µm' : 'g');
+                        return (
+                          <div key={key} style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                              <span style={{ fontSize: 9, color: COLORS.textSecondary, fontWeight: 700, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.06em' }}>
+                                {labels[key] || key}
+                              </span>
+                              <span style={{ fontSize: 11, color: colors[key], fontFamily: "'JetBrains Mono', monospace", fontWeight: 700 }}>
+                                {Number(freq).toFixed(1)}<span style={{ fontSize: 8, opacity: 0.7 }}> Hz</span>
+                              </span>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                              <span style={{ fontSize: 9, color: COLORS.textSecondary, fontFamily: "'JetBrains Mono', monospace" }}>
+                                {amplitude.toExponential(1)} <span style={{ fontSize: 7 }}>{unitSuff}</span>
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* ── FFT CHART CARD ── */}
             <div style={{
@@ -1091,7 +1456,7 @@ const Defect = ({ checkpointId }) => {
                 <div>
                   {/* Mode tabs */}
                   <div style={{ display: 'flex', gap: 0, marginBottom: 8, background: COLORS.cardAlt, borderRadius: 6, padding: 3, width: 'fit-content', border: `1px solid ${COLORS.border}` }}>
-                    {[{ k: 'time', l: 'Time Domain' }, { k: 'fft', l: 'FFT Spectrum' }].map(({ k, l }) => (
+                    {[{ k: 'time', l: 'Time Domain' }, { k: 'fft', l: 'FFT Spectrum' }, { k: 'trend', l: 'RMS Trend' }].map(({ k, l }) => (
                       <button key={k}
                         onClick={() => handleModeChange(k)}
                         style={{
@@ -1111,35 +1476,41 @@ const Defect = ({ checkpointId }) => {
                   </div>
                   <div style={{ ...styles.subTitle }}>
                     {mode === 'time'
-                      ? `CP-${activeCheckpointId ?? '—'} · ${selectedAxis.toUpperCase()} · ${chartData.length.toLocaleString()} pts`
-                      : `CP-${activeCheckpointId ?? '—'} · ${selectedAxis.toUpperCase()} · ${chartData.length.toLocaleString()} pts · ${data.freq_min?.toFixed(0)}–${data.freq_max?.toFixed(0)} Hz`
+                      ? `CP-${primaryCpId ?? '—'} · ${selectedAxis.toUpperCase()} · ${primaryChartData.length.toLocaleString()} pts`
+                      : mode === 'trend'
+                        ? `Machine Config #${selectedMasterId} · ${selectedAxis.toUpperCase()} axis · RMS trend over ${trendDays} days`
+                        : `CP-${primaryCpId ?? '—'} · ${selectedAxis.toUpperCase()} · ${primaryChartData.length.toLocaleString()} pts · ${primaryData?.freq_min?.toFixed(0)}–${primaryData?.freq_max?.toFixed(0)} Hz`
                     }
                   </div>
                 </div>
 
                 {/* Toolbar buttons */}
                 <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                  <TBtn onClick={handleExport}>
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
-                    </svg>
-                    Export
-                  </TBtn>
-                  <TBtn onClick={handleToggleBase} disabled={baseLoading} active={showBase}>
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                      <line x1="4" y1="12" x2="20" y2="12" /><line x1="12" y1="4" x2="12" y2="20" />
-                    </svg>
-                    {baseLoading ? 'Loading…' : showBase ? 'Hide Base' : 'Plot Base'}
-                  </TBtn>
-                  <TBtn onClick={handleToggleDefects} disabled={defectsLoading || mode !== 'fft'} active={showDefects}>
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
-                    </svg>
-                    {defectsLoading ? 'Loading…' : showDefects ? 'Hide Defects' : 'Defect Freq'}
-                  </TBtn>
+                  {mode !== 'trend' && (
+                    <>
+                      <TBtn onClick={handleExport}>
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
+                        </svg>
+                        Export
+                      </TBtn>
+                      <TBtn onClick={handleToggleBase} disabled={baseLoading} active={showBase}>
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                          <line x1="4" y1="12" x2="20" y2="12" /><line x1="12" y1="4" x2="12" y2="20" />
+                        </svg>
+                        {baseLoading ? 'Loading…' : showBase ? 'Hide Base' : 'Plot Base'}
+                      </TBtn>
+                      <TBtn onClick={handleToggleDefects} disabled={defectsLoading || mode !== 'fft'} active={showDefects}>
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+                        </svg>
+                        {defectsLoading ? 'Loading…' : showDefects ? 'Hide Defects' : 'Defect Freq'}
+                      </TBtn>
+                    </>
+                  )}
                   <TBtn onClick={() => {
                     fetchPlotData(selectedAxis, freqMin, freqMax, maxPoints, mode);
-                    if (showBase) fetchBasePlotData(selectedAxis, freqMin, freqMax, maxPoints, mode);
+                    if (showBase && mode !== 'trend') fetchBasePlotData(selectedAxis, freqMin, freqMax, maxPoints, mode);
                   }}>
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
                       <polyline points="1 4 1 10 7 10" /><path d="M3.51 15a9 9 0 102.13-9.36L1 10" />
@@ -1151,21 +1522,60 @@ const Defect = ({ checkpointId }) => {
 
               {/* Legend */}
               <div style={{ display: 'flex', gap: 20, marginBottom: 12, flexWrap: 'wrap', alignItems: 'center' }}>
-                <button
-                  onClick={() => setHideCurrent(prev => !prev)}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: 7, fontSize: 11,
-                    color: hideCurrent ? COLORS.textSecondary : COLORS.text,
-                    background: 'none', border: 'none', cursor: 'pointer',
-                    opacity: hideCurrent ? 0.35 : 1, transition: 'opacity 0.15s', padding: 0,
-                    fontWeight: 600, letterSpacing: '0.03em',
-                  }}
-                >
-                  <div style={{ width: 20, height: 3, background: ACCENT, borderRadius: 2, boxShadow: `0 0 6px ${ACCENT}` }} />
-                  {mode === 'time' ? 'Vibration Waveform' : 'Current FFT'}
-                </button>
+                {mode === 'trend' ? (
+                  <>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 11, color: COLORS.text, fontWeight: 600 }}>
+                      <div style={{ width: 20, height: 3, background: ACCENT, borderRadius: 2, boxShadow: `0 0 6px ${ACCENT}` }} />
+                      RMS Trend
+                    </div>
+                    {baseRms && (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 11, color: COLORS.text, fontWeight: 600 }}>
+                        <div style={{ width: 20, height: 3, borderTop: `2px dashed ${DANGER}` }} />
+                        Base RMS Baseline ({baseRms.value.toFixed(4)} g)
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  selectedCheckpointIds.map((cpId, idx) => {
+                    const cpVal = briefCheckpoints.find(c => c.id === cpId);
+                    const formattedDate = cpVal && cpVal.start
+                      ? new Date(cpVal.start).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })
+                      : `CP-${cpId}`;
+                    const isHidden = hiddenCheckpointIds.has(cpId);
+                    const color = colorsPalette[idx % colorsPalette.length];
 
-                {showBase && baseChartData.length > 0 && (
+                    return (
+                      <button
+                        key={cpId}
+                        onClick={() => {
+                          setHiddenCheckpointIds(prev => {
+                            const next = new Set(prev);
+                            if (next.has(cpId)) {
+                              if (next.size < selectedCheckpointIds.length - 1) {
+                                next.delete(cpId);
+                              }
+                            } else {
+                              next.add(cpId);
+                            }
+                            return next;
+                          });
+                        }}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 7, fontSize: 11,
+                          color: isHidden ? COLORS.textSecondary : COLORS.text,
+                          background: 'none', border: 'none', cursor: 'pointer',
+                          opacity: isHidden ? 0.35 : 1, transition: 'opacity 0.15s', padding: 0,
+                          fontWeight: 600, letterSpacing: '0.03em',
+                        }}
+                      >
+                        <div style={{ width: 20, height: 3, background: color, borderRadius: 2, boxShadow: `0 0 6px ${color}` }} />
+                        {formattedDate}
+                      </button>
+                    );
+                  })
+                )}
+
+                {mode !== 'trend' && showBase && baseChartData.length > 0 && (
                   <button
                     onClick={() => setHideBase(prev => !prev)}
                     style={{
@@ -1181,7 +1591,7 @@ const Defect = ({ checkpointId }) => {
                   </button>
                 )}
 
-                {dominantFreq && mode === 'fft' && (
+                {mode !== 'trend' && dominantFreq && mode === 'fft' && (
                   <div style={{
                     display: 'flex', alignItems: 'center', gap: 6, fontSize: 11,
                     color: COLORS.textSecondary, marginLeft: 'auto',
@@ -1293,13 +1703,18 @@ const Defect = ({ checkpointId }) => {
               }}>
                 {mode === 'time' ? (
                   <>
-                    <span>Duration: <strong style={{ color: COLORS.text }}>{chartData.length ? (chartData[chartData.length - 1].freq - chartData[0].freq).toFixed(3) : 0} s</strong></span>
-                    <span>Points: <strong style={{ color: COLORS.text }}>{chartData.length.toLocaleString()}</strong></span>
+                    <span>Duration: <strong style={{ color: COLORS.text }}>{primaryChartData.length ? (primaryChartData[primaryChartData.length - 1].freq - primaryChartData[0].freq).toFixed(3) : 0} s</strong></span>
+                    <span>Points: <strong style={{ color: COLORS.text }}>{primaryChartData.length.toLocaleString()}</strong></span>
+                  </>
+                ) : mode === 'trend' ? (
+                  <>
+                    <span>Trend Range: <strong style={{ color: COLORS.text }}>{trendDays} Days</strong></span>
+                    <span>Checkpoints: <strong style={{ color: COLORS.text }}>{trendData.length}</strong></span>
                   </>
                 ) : (
                   <>
-                    <span>Freq range: <strong style={{ color: COLORS.text }}>{data.freq_min?.toFixed(1)} – {data.freq_max?.toFixed(1)} Hz</strong></span>
-                    <span>Fs: <strong style={{ color: COLORS.text }}>{formatSR(data.sampling_rate_hz)}</strong></span>
+                    <span>Freq range: <strong style={{ color: COLORS.text }}>{primaryData?.freq_min?.toFixed(1)} – {primaryData?.freq_max?.toFixed(1)} Hz</strong></span>
+                    <span>Fs: <strong style={{ color: COLORS.text }}>{formatSR(primaryData?.sampling_rate_hz)}</strong></span>
                   </>
                 )}
               </div>
@@ -1328,20 +1743,38 @@ const Defect = ({ checkpointId }) => {
                         </tr>
                       </thead>
                       <tbody>
-                        {/* Current row */}
-                        <tr style={{ borderBottom: `1px solid ${COLORS.border}`, background: COLORS.accentDim, borderLeft: `3px solid ${ACCENT}` }}>
-                          <td style={{ padding: '10px 14px', fontWeight: 700, color: ACCENT, fontSize: 12, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.03em' }}>
-                            Current
-                          </td>
-                          {[[0, 1000], [1000, 3000], [3000, 5000], [5000, 10000]].map(([lo, hi]) => (
-                            <td key={lo} style={{ padding: '10px 14px', textAlign: 'right', fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, color: COLORS.text }}>
-                              {(() => { const pts = chartData.filter(d => d.freq >= lo && d.freq <= hi); return pts.length ? Math.sqrt(pts.reduce((s, d) => s + (d.amplitude / Math.sqrt(2)) ** 2, 0)).toFixed(3) : '0.000'; })()}
-                            </td>
-                          ))}
-                          <td style={{ padding: '10px 14px', textAlign: 'right', fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, color: ACCENT }}>
-                            {data.rms ? Number(data.rms).toFixed(3) : '0.000'}
-                          </td>
-                        </tr>
+                        {selectedCheckpointIds.map((cpId, idx) => {
+                          const cpPlot = checkpointPlots[cpId];
+                          const cpData = cpPlot?.data;
+                          const cpChartData = cpPlot?.chartData ?? [];
+
+                          const cpVal = briefCheckpoints.find(c => c.id === cpId);
+                          const label = cpVal && cpVal.start
+                            ? new Date(cpVal.start).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })
+                            : `CP-${cpId}`;
+
+                          const color = colorsPalette[idx % colorsPalette.length];
+
+                          return (
+                            <tr key={cpId} style={{ borderBottom: `1px solid ${COLORS.border}`, background: isDarkMode ? 'rgba(255,255,255,0.01)' : 'transparent', borderLeft: `3px solid ${color}` }}>
+                              <td style={{ padding: '10px 14px', fontWeight: 700, color: color, fontSize: 12, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.03em' }}>
+                                {label}
+                              </td>
+                              {[[0, 1000], [1000, 3000], [3000, 5000], [5000, 10000]].map(([lo, hi]) => (
+                                <td key={lo} style={{ padding: '10px 14px', textAlign: 'right', fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, color: COLORS.text }}>
+                                  {(() => {
+                                    const pts = cpChartData.filter(d => d.freq >= lo && d.freq <= hi);
+                                    return pts.length ? Math.sqrt(pts.reduce((s, d) => s + (d.amplitude / Math.sqrt(2)) ** 2, 0)).toFixed(3) : '0.000';
+                                  })()}
+                                </td>
+                              ))}
+                              <td style={{ padding: '10px 14px', textAlign: 'right', fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, color: color }}>
+                                {cpData?.rms ? Number(cpData.rms).toFixed(3) : '0.000'}
+                              </td>
+                            </tr>
+                          );
+                        })}
+
                         {/* Base row */}
                         {showBase && baseChartData.length > 0 && (
                           <tr style={{ background: COLORS.dangerDim, borderLeft: `3px solid ${DANGER}` }}>
