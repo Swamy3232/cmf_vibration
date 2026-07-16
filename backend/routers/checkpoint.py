@@ -52,15 +52,15 @@ def get_recent_base_checkpoint(master_id: int | None = None, db: Session = Depen
 @router.get("/brief")
 def get_checkpoints_brief(master_id: int | None = None, db: Session = Depends(get_db)):
     """
-    Returns a list of checkpoints containing only their id and start timestamp.
+    Returns a list of checkpoints containing only their id, start timestamp, end timestamp, and duration.
     Optionally filter by master_id.
     """
-    query = db.query(CheckpointModel.id, CheckpointModel.start)
+    query = db.query(CheckpointModel.id, CheckpointModel.start, CheckpointModel.end, CheckpointModel.duration)
     if master_id is not None:
         query = query.filter(CheckpointModel.master_id == master_id)
     
     results = query.order_by(CheckpointModel.start.desc()).all()
-    return [{"id": r.id, "start": r.start} for r in results]
+    return [{"id": r.id, "start": r.start, "end": r.end, "duration": r.duration} for r in results]
 
 
 

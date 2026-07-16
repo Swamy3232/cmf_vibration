@@ -6,6 +6,10 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
+import {
+  ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip as RechartsTooltip, Legend, Cell,
+  PieChart, Pie
+} from 'recharts';
 
 import { useTheme } from '../contexts/ThemeContext';
 import {
@@ -19,6 +23,7 @@ import {
 
 import { API_BASE_URL } from '../config/api';
 import { applyScaling } from '../utils/scalling';
+import { exportRawSignal, exportFFTAllUnits, exportGraphPNG, exportCompleteReportDoc } from '../utils/export.utils';
 
 // ─────────────────────────────────────────────
 // COMPONENT
@@ -55,6 +60,8 @@ const Defect = ({ checkpointId }) => {
   const [selectedMasterId, setSelectedMasterId] = useState(null);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const dropdownRef = useRef(null);
+  const [exportDropdownOpen, setExportDropdownOpen] = useState(false);
+  const exportDropdownRef = useRef(null);
 
   // ── slider zoom state (client-side, no API call) ───
   const [sliderMin, setSliderMin] = useState(0);
@@ -83,6 +90,8 @@ const Defect = ({ checkpointId }) => {
   const [defectFrequencies, setDefectFrequencies] = useState(null);
   const [showDefects, setShowDefects] = useState(false);
   const [defectsLoading, setDefectsLoading] = useState(false);
+  const [rmsViewMode, setRmsViewMode] = useState('table'); // 'table' or 'graph'
+  const [rmsGraphType, setRmsGraphType] = useState('bar'); // 'bar', 'pie', 'donut', 'gantt'
 
 
   const chartRef = useRef(null);
@@ -495,6 +504,81 @@ const Defect = ({ checkpointId }) => {
     });
   }, [selectedCheckpointIds, checkpointPlots, baseChartData, showBase, sliderMin, sliderMax, primaryChartData, primaryCpId, scalingType, mode, trendData, baseRms]);
 
+  const rmsSummaryData = useMemo(() => {
+    const list = [
+      ...selectedCheckpointIds.map((cpId, idx) => {
+        const cpPlot = checkpointPlots[cpId];
+        const cpData = cpPlot?.data;
+        const cpChartData = cpPlot?.chartData ?? [];
+
+        const cpVal = briefCheckpoints.find(c => c.id === cpId);
+        const label = cpVal && cpVal.start
+          ? new Date(cpVal.start).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })
+          : `CP-${cpId}`;
+
+        const color = colorsPalette[idx % colorsPalette.length];
+
+        const bands = [[0, 1000], [1000, 3000], [3000, 5000], [5000, 10000]].map(([lo, hi]) => {
+          const pts = cpChartData.filter(d => d.freq >= lo && d.freq <= hi);
+          return pts.length ? Math.sqrt(pts.reduce((s, d) => s + (d.amplitude / Math.sqrt(2)) ** 2, 0)) : 0;
+        });
+
+        const overall = cpData?.rms ? Number(cpData.rms) : 0;
+
+        return {
+          id: cpId,
+          label,
+          isBase: false,
+          color,
+          bands: {
+            '0–1 kHz': bands[0],
+            '1–3 kHz': bands[1],
+            '3–5 kHz': bands[2],
+            '5–10 kHz': bands[3]
+          },
+          '0–1 kHz': bands[0],
+          '1–3 kHz': bands[1],
+          '3–5 kHz': bands[2],
+          '5–10 kHz': bands[3],
+          overall,
+          start: cpVal?.start ? new Date(cpVal.start) : null,
+          end: cpVal?.end ? new Date(cpVal.end) : (cpVal?.start ? new Date(new Date(cpVal.start).getTime() + (cpVal.duration || 10) * 1000) : null),
+          duration: cpVal?.duration || (cpVal?.start && cpVal?.end ? (new Date(cpVal.end).getTime() - new Date(cpVal.start).getTime()) / 1000 : 0)
+        };
+      })
+    ];
+
+    if (showBase && baseChartData.length > 0) {
+      const bands = [[0, 1000], [1000, 3000], [3000, 5000], [5000, 10000]].map(([lo, hi]) => {
+        const pts = baseChartData.filter(d => d.freq >= lo && d.freq <= hi);
+        return pts.length ? Math.sqrt(pts.reduce((s, d) => s + (d.amplitude / Math.sqrt(2)) ** 2, 0)) : 0;
+      });
+      const overall = baseData?.rms ? Number(baseData.rms) : 0;
+      list.push({
+        id: 'base',
+        label: 'Base',
+        isBase: true,
+        color: DANGER,
+        bands: {
+          '0–1 kHz': bands[0],
+          '1–3 kHz': bands[1],
+          '3–5 kHz': bands[2],
+          '5–10 kHz': bands[3]
+        },
+        '0–1 kHz': bands[0],
+        '1–3 kHz': bands[1],
+        '3–5 kHz': bands[2],
+        '5–10 kHz': bands[3],
+        overall,
+        start: null,
+        end: null,
+        duration: 0
+      });
+    }
+
+    return list;
+  }, [selectedCheckpointIds, checkpointPlots, briefCheckpoints, showBase, baseChartData, baseData, colorsPalette, DANGER]);
+
 
   // ── uPlot Rendering Effect ───────────────────
   useEffect(() => {
@@ -799,17 +883,6 @@ const Defect = ({ checkpointId }) => {
       }
     };
   }, [displayData, showBase, mode, isDarkMode, COLORS, hiddenCheckpointIds, hideBase, dominantFreq, selectedUnit, showDefects, defectFrequencies, selectedCheckpointIds, briefCheckpoints, scalingType, baseRms]);
-
-  const handleExport = () => {
-    if (!primaryChartData.length) return;
-    const csv = ['frequency_hz,amplitude', ...primaryChartData.map(d => `${d.freq},${d.amplitude}`)].join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `fft_checkpoint${primaryCpId}_${selectedAxis}.csv`;
-    a.click();
-  };
-
   // ── derived metrics ──────────────────────────
   const METRICS = [
     {
@@ -985,6 +1058,9 @@ const Defect = ({ checkpointId }) => {
     const handleOutsideClick = (e) => {
       if (dropdownRef.current && !dropdownRef.current.contains(e.target)) {
         setDropdownOpen(false);
+      }
+      if (exportDropdownRef.current && !exportDropdownRef.current.contains(e.target)) {
+        setExportDropdownOpen(false);
       }
     };
     document.addEventListener('mousedown', handleOutsideClick);
@@ -1488,12 +1564,122 @@ const Defect = ({ checkpointId }) => {
                 <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                   {mode !== 'trend' && (
                     <>
-                      <TBtn onClick={handleExport}>
-                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                          <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
-                        </svg>
-                        Export
-                      </TBtn>
+                      {/* Export Dropdown */}
+                      <div ref={exportDropdownRef} style={{ position: 'relative', display: 'inline-block' }}>
+                        <TBtn onClick={() => setExportDropdownOpen(!exportDropdownOpen)}>
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
+                          </svg>
+                          Export
+                          <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" style={{ marginLeft: 4, transition: 'transform 0.15s', transform: exportDropdownOpen ? 'rotate(180deg)' : 'none' }}>
+                            <polyline points="6 9 12 15 18 9" />
+                          </svg>
+                        </TBtn>
+
+                        {exportDropdownOpen && (
+                          <div style={{
+                            position: 'absolute',
+                            top: '100%',
+                            right: 0,
+                            marginTop: 4,
+                            background: COLORS.card,
+                            border: `1px solid ${COLORS.border}`,
+                            borderRadius: 6,
+                            boxShadow: '0 8px 24px rgba(0,0,0,0.3)',
+                            zIndex: 100,
+                            minWidth: 220,
+                            overflow: 'hidden',
+                            padding: '4px 0',
+                          }}>
+                            {[
+                              {
+                                label: 'Raw Signal (CSV)',
+                                action: () => {
+                                  if (primaryCpId) exportRawSignal(primaryCpId, selectedAxis, maxPoints);
+                                }
+                              },
+                              {
+                                label: 'FFT (Accel, Vel, Disp) (CSV)',
+                                action: () => {
+                                  if (primaryCpId) exportFFTAllUnits(primaryCpId, selectedAxis, maxPoints, freqMin, freqMax);
+                                }
+                              },
+                              {
+                                label: 'PNG (Graph Image)',
+                                action: () => {
+                                  const canvas = chartRef.current?.querySelector('canvas') || document.querySelector('.uplot canvas');
+                                  if (canvas && primaryCpId) exportGraphPNG(canvas, primaryCpId, selectedAxis);
+                                  else alert('Graph canvas not loaded or found.');
+                                }
+                              },
+                              {
+                                label: 'A Complete Report (Word)',
+                                action: () => {
+                                  const canvas = chartRef.current?.querySelector('canvas') || document.querySelector('.uplot canvas');
+                                  if (!canvas) {
+                                    alert('Graph canvas not loaded. Cannot generate report.');
+                                    return;
+                                  }
+                                  const chartImageBase64 = canvas.toDataURL('image/png');
+                                  const mt = masterTables.find(m => m.id === selectedMasterId);
+                                  const mach = mt ? machines.find(m => m.id === mt.machine_id) : null;
+                                  const machineName = mach ? mach.name : `Machine Configuration #${selectedMasterId}`;
+                                  
+                                  const checkpointDetails = selectedCheckpointIds.map(cpId => {
+                                    const cpVal = briefCheckpoints.find(c => c.id === cpId);
+                                    return {
+                                      id: cpId,
+                                      start: cpVal?.start,
+                                      end: cpVal?.end,
+                                      duration: cpVal?.duration || (cpVal?.start && cpVal?.end ? (new Date(cpVal.end).getTime() - new Date(cpVal.start).getTime()) / 1000 : 0),
+                                      axis: selectedAxis
+                                    };
+                                  });
+
+                                  exportCompleteReportDoc({
+                                    machineName,
+                                    checkpointDetails,
+                                    chartImageBase64,
+                                    rmsSummaryData: mode === 'fft' ? rmsSummaryData : []
+                                  });
+                                }
+                              }
+                            ].map((opt, oIdx) => (
+                              <button
+                                key={oIdx}
+                                onClick={() => {
+                                  opt.action();
+                                  setExportDropdownOpen(false);
+                                }}
+                                style={{
+                                  width: '100%',
+                                  background: 'transparent',
+                                  border: 'none',
+                                  color: COLORS.text,
+                                  padding: '8px 16px',
+                                  fontSize: 11,
+                                  fontWeight: 600,
+                                  textAlign: 'left',
+                                  cursor: 'pointer',
+                                  fontFamily: "'JetBrains Mono', monospace",
+                                  display: 'block',
+                                  transition: 'background 0.15s, color 0.15s',
+                                }}
+                                onMouseEnter={e => {
+                                  e.currentTarget.style.background = COLORS.accentDim;
+                                  e.currentTarget.style.color = ACCENT;
+                                }}
+                                onMouseLeave={e => {
+                                  e.currentTarget.style.background = 'transparent';
+                                  e.currentTarget.style.color = COLORS.text;
+                                }}
+                              >
+                                {opt.label}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                       <TBtn onClick={handleToggleBase} disabled={baseLoading} active={showBase}>
                         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
                           <line x1="4" y1="12" x2="20" y2="12" /><line x1="12" y1="4" x2="12" y2="20" />
@@ -1723,77 +1909,246 @@ const Defect = ({ checkpointId }) => {
               {mode === 'fft' && (
                 <div style={{ marginTop: 20, paddingTop: 18, borderTop: `1px solid ${COLORS.border}` }}>
                   <div style={{
-                    display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12,
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 12
                   }}>
-                    <div style={{ width: 3, height: 14, background: ACCENT, borderRadius: 2 }} />
-                    <div style={{ ...styles.sectionTitle, fontSize: 11 }}>RMS Band Energy Summary</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <div style={{ width: 3, height: 14, background: ACCENT, borderRadius: 2 }} />
+                      <div style={{ ...styles.sectionTitle, fontSize: 11 }}>RMS Band Energy Summary</div>
+                    </div>
+
+                    {/* Table / Graph view toggle */}
+                    <div style={{ display: 'flex', gap: 0, background: COLORS.cardAlt, borderRadius: 6, padding: 3, border: `1px solid ${COLORS.border}` }}>
+                      {[{ k: 'table', l: 'Table View' }, { k: 'graph', l: 'Graph View' }].map(({ k, l }) => (
+                        <button key={k}
+                          onClick={() => setRmsViewMode(k)}
+                          style={{
+                            background: rmsViewMode === k ? COLORS.card : 'transparent',
+                            border: 'none',
+                            color: rmsViewMode === k ? ACCENT : COLORS.textSecondary,
+                            fontSize: 11, fontWeight: 700,
+                            padding: '4px 12px', cursor: 'pointer',
+                            borderRadius: 4, transition: 'all 150ms ease',
+                            boxShadow: rmsViewMode === k ? `0 1px 4px rgba(0,0,0,0.3), 0 0 0 1px ${COLORS.border}` : 'none',
+                            letterSpacing: '0.02em',
+                          }}
+                        >
+                          {l}
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                  <div style={{ overflowX: 'auto', borderRadius: 6, border: `1px solid ${COLORS.border}` }}>
-                    <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: 12 }}>
-                      <thead>
-                        <tr style={{ background: isDarkMode ? '#070c18' : '#f0f4f8', borderBottom: `1px solid ${COLORS.border}` }}>
-                          {['Dataset', '0–1 kHz', '1–3 kHz', '3–5 kHz', '5–10 kHz', 'Overall RMS'].map(h => (
-                            <th key={h} style={{
-                              padding: '9px 14px', color: COLORS.textSecondary, fontWeight: 700,
-                              textAlign: h === 'Dataset' ? 'left' : 'right',
-                              fontSize: 9, letterSpacing: '0.1em', textTransform: 'uppercase',
-                              fontFamily: "'JetBrains Mono', monospace",
-                            }}>{h}</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {selectedCheckpointIds.map((cpId, idx) => {
-                          const cpPlot = checkpointPlots[cpId];
-                          const cpData = cpPlot?.data;
-                          const cpChartData = cpPlot?.chartData ?? [];
 
-                          const cpVal = briefCheckpoints.find(c => c.id === cpId);
-                          const label = cpVal && cpVal.start
-                            ? new Date(cpVal.start).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })
-                            : `CP-${cpId}`;
-
-                          const color = colorsPalette[idx % colorsPalette.length];
-
-                          return (
-                            <tr key={cpId} style={{ borderBottom: `1px solid ${COLORS.border}`, background: isDarkMode ? 'rgba(255,255,255,0.01)' : 'transparent', borderLeft: `3px solid ${color}` }}>
-                              <td style={{ padding: '10px 14px', fontWeight: 700, color: color, fontSize: 12, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.03em' }}>
-                                {label}
+                  {rmsViewMode === 'table' ? (
+                    <div style={{ overflowX: 'auto', borderRadius: 6, border: `1px solid ${COLORS.border}` }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: 12 }}>
+                        <thead>
+                          <tr style={{ background: isDarkMode ? '#070c18' : '#f0f4f8', borderBottom: `1px solid ${COLORS.border}` }}>
+                            {['Dataset', '0–1 kHz', '1–3 kHz', '3–5 kHz', '5–10 kHz', 'Overall RMS'].map(h => (
+                              <th key={h} style={{
+                                padding: '9px 14px', color: COLORS.textSecondary, fontWeight: 700,
+                                textAlign: h === 'Dataset' ? 'left' : 'right',
+                                fontSize: 9, letterSpacing: '0.1em', textTransform: 'uppercase',
+                                fontFamily: "'JetBrains Mono', monospace",
+                              }}>{h}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {rmsSummaryData.map((row) => (
+                            <tr key={row.id} style={{
+                              borderBottom: `1px solid ${COLORS.border}`,
+                              background: row.isBase ? COLORS.dangerDim : (isDarkMode ? 'rgba(255,255,255,0.01)' : 'transparent'),
+                              borderLeft: `3px solid ${row.color}`
+                            }}>
+                              <td style={{ padding: '10px 14px', fontWeight: 700, color: row.color, fontSize: 12, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.03em' }}>
+                                {row.label}
                               </td>
-                              {[[0, 1000], [1000, 3000], [3000, 5000], [5000, 10000]].map(([lo, hi]) => (
-                                <td key={lo} style={{ padding: '10px 14px', textAlign: 'right', fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, color: COLORS.text }}>
-                                  {(() => {
-                                    const pts = cpChartData.filter(d => d.freq >= lo && d.freq <= hi);
-                                    return pts.length ? Math.sqrt(pts.reduce((s, d) => s + (d.amplitude / Math.sqrt(2)) ** 2, 0)).toFixed(3) : '0.000';
-                                  })()}
+                              {['0–1 kHz', '1–3 kHz', '3–5 kHz', '5–10 kHz'].map(bandKey => (
+                                <td key={bandKey} style={{ padding: '10px 14px', textAlign: 'right', fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, color: COLORS.text }}>
+                                  {row.bands[bandKey].toFixed(3)}
                                 </td>
                               ))}
-                              <td style={{ padding: '10px 14px', textAlign: 'right', fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, color: color }}>
-                                {cpData?.rms ? Number(cpData.rms).toFixed(3) : '0.000'}
+                              <td style={{ padding: '10px 14px', textAlign: 'right', fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, color: row.color }}>
+                                {row.overall.toFixed(3)}
                               </td>
                             </tr>
-                          );
-                        })}
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div>
+                      {/* Graph Type Selector tabs */}
+                      <div style={{ display: 'flex', gap: 0, marginBottom: 16, background: COLORS.cardAlt, borderRadius: 6, padding: 3, width: 'fit-content', border: `1px solid ${COLORS.border}` }}>
+                        {[{ k: 'bar', l: 'Bar' }, { k: 'pie', l: 'Pie' }, { k: 'donut', l: 'Donut' }, { k: 'gantt', l: 'Gantt' }].map(({ k, l }) => (
+                          <button key={k}
+                            onClick={() => setRmsGraphType(k)}
+                            style={{
+                              background: rmsGraphType === k ? COLORS.card : 'transparent',
+                              border: 'none',
+                              color: rmsGraphType === k ? ACCENT : COLORS.textSecondary,
+                              fontSize: 11, fontWeight: 700,
+                              padding: '4px 12px', cursor: 'pointer',
+                              borderRadius: 4, transition: 'all 150ms ease',
+                              boxShadow: rmsGraphType === k ? `0 1px 4px rgba(0,0,0,0.3), 0 0 0 1px ${COLORS.border}` : 'none',
+                              letterSpacing: '0.02em',
+                            }}
+                          >
+                            {l}
+                          </button>
+                        ))}
+                      </div>
 
-                        {/* Base row */}
-                        {showBase && baseChartData.length > 0 && (
-                          <tr style={{ background: COLORS.dangerDim, borderLeft: `3px solid ${DANGER}` }}>
-                            <td style={{ padding: '10px 14px', fontWeight: 700, color: DANGER, fontSize: 12, fontFamily: "'JetBrains Mono', monospace", letterSpacing: '0.03em' }}>
-                              Base
-                            </td>
-                            {[[0, 1000], [1000, 3000], [3000, 5000], [5000, 10000]].map(([lo, hi]) => (
-                              <td key={lo} style={{ padding: '10px 14px', textAlign: 'right', fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, color: COLORS.text }}>
-                                {(() => { const pts = baseChartData.filter(d => d.freq >= lo && d.freq <= hi); return pts.length ? Math.sqrt(pts.reduce((s, d) => s + (d.amplitude / Math.sqrt(2)) ** 2, 0)).toFixed(3) : '0.000'; })()}
-                              </td>
-                            ))}
-                            <td style={{ padding: '10px 14px', textAlign: 'right', fontFamily: "'JetBrains Mono', monospace", fontWeight: 700, color: DANGER }}>
-                              {baseData?.rms ? Number(baseData.rms).toFixed(3) : '0.000'}
-                            </td>
-                          </tr>
-                        )}
-                      </tbody>
-                    </table>
-                  </div>
+                      {rmsGraphType === 'bar' && (
+                        <div style={{ background: isDarkMode ? 'rgba(255,255,255,0.01)' : '#f8fafc', border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: 16 }}>
+                          <ResponsiveContainer width="100%" height={320}>
+                            <BarChart data={rmsSummaryData} margin={{ top: 10, right: 10, left: -20, bottom: 5 }}>
+                              <XAxis dataKey="label" stroke={COLORS.textSecondary} style={{ fontSize: 10, fontFamily: "'JetBrains Mono', monospace" }} />
+                              <YAxis stroke={COLORS.textSecondary} style={{ fontSize: 10, fontFamily: "'JetBrains Mono', monospace" }} />
+                              <RechartsTooltip
+                                contentStyle={{
+                                  background: COLORS.card,
+                                  border: `1px solid ${COLORS.borderAccent}`,
+                                  borderRadius: 8,
+                                  fontSize: 12,
+                                  fontFamily: "'JetBrains Mono', monospace",
+                                  color: COLORS.text,
+                                }}
+                              />
+                              <Legend wrapperStyle={{ fontSize: 10, fontFamily: "'JetBrains Mono', monospace", paddingTop: 10 }} />
+                              <Bar dataKey="0–1 kHz" fill="#06b6d4" radius={[4, 4, 0, 0]} />
+                              <Bar dataKey="1–3 kHz" fill="#a855f7" radius={[4, 4, 0, 0]} />
+                              <Bar dataKey="3–5 kHz" fill="#10b981" radius={[4, 4, 0, 0]} />
+                              <Bar dataKey="5–10 kHz" fill="#f59e0b" radius={[4, 4, 0, 0]} />
+                              <Bar dataKey="overall" name="Overall RMS" fill="#ec4899" radius={[4, 4, 0, 0]} />
+                            </BarChart>
+                          </ResponsiveContainer>
+                        </div>
+                      )}
+
+                      {(rmsGraphType === 'pie' || rmsGraphType === 'donut') && (
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 16 }}>
+                          {rmsSummaryData.map((item) => {
+                            const pieData = [
+                              { name: '0–1 kHz', value: item['0–1 kHz'], fill: '#06b6d4' },
+                              { name: '1–3 kHz', value: item['1–3 kHz'], fill: '#a855f7' },
+                              { name: '3–5 kHz', value: item['3–5 kHz'], fill: '#10b981' },
+                              { name: '5–10 kHz', value: item['5–10 kHz'], fill: '#f59e0b' },
+                            ];
+                            return (
+                              <div key={item.id} style={{
+                                display: 'flex', flexDirection: 'column', alignItems: 'center',
+                                background: isDarkMode ? 'rgba(255,255,255,0.02)' : '#f8fafc',
+                                border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: 16
+                              }}>
+                                <div style={{ fontSize: 12, fontWeight: 700, color: item.color, fontFamily: "'JetBrains Mono', monospace", marginBottom: 12 }}>
+                                  {item.label}
+                                </div>
+                                <ResponsiveContainer width="100%" height={160}>
+                                  <PieChart>
+                                    <Pie
+                                      data={pieData}
+                                      dataKey="value"
+                                      nameKey="name"
+                                      cx="50%"
+                                      cy="50%"
+                                      outerRadius={65}
+                                      innerRadius={rmsGraphType === 'donut' ? 40 : 0}
+                                      paddingAngle={2}
+                                    >
+                                      {pieData.map((entry, index) => (
+                                        <Cell key={`cell-${index}`} fill={entry.fill} />
+                                      ))}
+                                    </Pie>
+                                    <RechartsTooltip
+                                      formatter={(value) => [`${Number(value).toFixed(3)} g`, 'RMS']}
+                                      contentStyle={{
+                                        background: COLORS.card,
+                                        border: `1px solid ${COLORS.borderAccent}`,
+                                        borderRadius: 6,
+                                        fontSize: 10,
+                                        fontFamily: "'JetBrains Mono', monospace",
+                                        color: COLORS.text,
+                                      }}
+                                    />
+                                  </PieChart>
+                                </ResponsiveContainer>
+                                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 12px', width: '100%', fontSize: 10, marginTop: 12, fontFamily: "'JetBrains Mono', monospace" }}>
+                                  {pieData.map(d => (
+                                    <div key={d.name} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                      <div style={{ width: 8, height: 8, borderRadius: '50%', background: d.fill }} />
+                                      <span style={{ color: COLORS.textSecondary }}>{d.name.split(' ')[0]}:</span>
+                                      <strong style={{ color: COLORS.text }}>{Number(d.value).toFixed(3)}</strong>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {rmsGraphType === 'gantt' && (() => {
+                        const bandsList = ['0–1 kHz', '1–3 kHz', '3–5 kHz', '5–10 kHz'];
+                        const horizontalData = bandsList.map(band => {
+                          const dataPoint = { name: band };
+                          rmsSummaryData.forEach(item => {
+                            dataPoint[item.id] = item.bands[band] || 0;
+                          });
+                          return dataPoint;
+                        });
+
+                        return (
+                          <div style={{ background: isDarkMode ? 'rgba(255,255,255,0.01)' : '#f8fafc', border: `1px solid ${COLORS.border}`, borderRadius: 8, padding: 16 }}>
+                            <ResponsiveContainer width="100%" height={320}>
+                              <BarChart
+                                data={horizontalData}
+                                layout="vertical"
+                                margin={{ top: 10, right: 30, left: 20, bottom: 5 }}
+                              >
+                                <XAxis
+                                  type="number"
+                                  stroke={COLORS.textSecondary}
+                                  style={{ fontSize: 10, fontFamily: "'JetBrains Mono', monospace" }}
+                                />
+                                <YAxis
+                                  type="category"
+                                  dataKey="name"
+                                  stroke={COLORS.textSecondary}
+                                  style={{ fontSize: 10, fontFamily: "'JetBrains Mono', monospace" }}
+                                  width={80}
+                                />
+                                <RechartsTooltip
+                                  contentStyle={{
+                                    background: COLORS.card,
+                                    border: `1px solid ${COLORS.borderAccent}`,
+                                    borderRadius: 8,
+                                    fontSize: 12,
+                                    fontFamily: "'JetBrains Mono', monospace",
+                                    color: COLORS.text,
+                                  }}
+                                  formatter={(value, name) => {
+                                    const ds = rmsSummaryData.find(item => item.id === name || item.label === name);
+                                    return [`${Number(value).toFixed(3)} g`, ds ? ds.label : name];
+                                  }}
+                                />
+                                <Legend wrapperStyle={{ fontSize: 10, fontFamily: "'JetBrains Mono', monospace", paddingTop: 10 }} />
+                                {rmsSummaryData.map((item) => (
+                                  <Bar
+                                    key={item.id}
+                                    dataKey={item.id}
+                                    name={item.label}
+                                    fill={item.color}
+                                    radius={[0, 4, 4, 0]}
+                                  />
+                                ))}
+                              </BarChart>
+                            </ResponsiveContainer>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
